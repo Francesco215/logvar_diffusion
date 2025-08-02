@@ -169,7 +169,7 @@ class ToyModel(torch.nn.Module):
 
         if new:
             self.layer_logvar = torch.nn.Linear(hidden_dim, 2)
-            self.gain_logvar= torch.nn.Parameter(torch.zeros([]))
+            self.gain_logvar= torch.nn.Parameter(torch.zeros([])).requires_grad_(False)
         self.new=new
 
     def forward(self, x, sigma=0):
@@ -223,7 +223,10 @@ class ToyModel(torch.nn.Module):
         # The squared norm || F - target ||^2
         # For vectors, this would be a sum over the feature dimension
         error = (F - target)**2
-        if not self.new: return .5*(error/sigma_t**2).sum(dim=-1)
+
+        if not self.new:
+            coeff = self.sigma_data**2/(sigma_t**2+self.sigma_data**2)
+            return -.5*(error*coeff).sum(dim=-1)
 
         # The coefficient from the formula
         coeff = self.sigma_data**2 / (sigma_t**2 + 2 * self.sigma_data**2)
@@ -281,6 +284,7 @@ def do_train(new=False, score_matching=True,
         if viz_iter is not None and iter_idx % viz_iter == 0:
             for x in plt.gca().lines: x.remove()
             do_plot(ema, elems={'samples'}, device=device)
+            plt.savefig("immagine.png")
             plt.gcf().canvas.flush_events()
 
         # Execute one training iteration.
@@ -305,10 +309,11 @@ def do_train(new=False, score_matching=True,
             nll = net.loss(clean_samples, sigma)
             nll.backward()
             opt.step()
-            with torch.no_grad():
-                gt_scores = gt(classes, device).score(noisy_samples, sigma)
-                net_scores = net.score(noisy_samples, sigma, graph=False)
-                score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)).mean()
+            if iter_idx%16==0:
+                with torch.no_grad():
+                    gt_scores = gt(classes, device).score(noisy_samples, sigma)
+                    net_scores = net.score(noisy_samples, sigma, graph=False)
+                    score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)).mean()
 
         pbar.set_postfix_str(f"Score-Matching Loss: {score_matching_loss.item():.3f}, Negative Log-Likelyhood Loss: {nll.item():.3f}")
 
@@ -330,6 +335,7 @@ def do_train(new=False, score_matching=True,
 #----------------------------------------------------------------------------
 # Simulate the EDM sampling ODE for the given set of initial sample points.
 
+@torch.no_grad()
 def do_sample(net, x_init, guidance=1, gnet=None, num_steps=32, sigma_min=0.002, sigma_max=5, rho=7):
     # Guided denoiser.
     def denoise(x, sigma):
@@ -366,6 +372,7 @@ def do_sample(net, x_init, guidance=1, gnet=None, num_steps=32, sigma_min=0.002,
 #----------------------------------------------------------------------------
 # Draw the given set of plot elements using matplotlib.
 
+@torch.no_grad()
 def do_plot(
     net=None, guidance=1, gnet=None, elems={'gt_uncond', 'gt_outline', 'samples'},
     view_x=0, view_y=0, view_size=1.6, grid_resolution=400, arrow_len=0.002,
