@@ -194,11 +194,12 @@ $$
 > Hint
 > If you want to verify this formula, first substituite $\sigma_\phi$ and then substituite $\mu_\theta$
 
-Using this parametrization we can re-write the log prob
+Using this parametrization we can re-write the log prob.
 
 $$
 \log q(x|\tilde x) =- \frac{1}{2} \left[G_\phi + e^{-G_\phi} \left( \frac{\sigma_\textrm{data}^2}{\sigma^2 + 2\sigma_\textrm{data}^2} \right) \left\| F_{\theta} - \frac{x - c_\textrm{skip} \cdot \tilde x}{c_\textrm{out}} \right\|^2+ \log(2\pi c_\textrm{var}^2)\right]
 $$
+As you can see, this formulation is numerically stable for all values of $\sigma$
 
 # Solving the ODE
 

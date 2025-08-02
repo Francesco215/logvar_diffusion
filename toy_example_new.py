@@ -197,19 +197,25 @@ class ToyModel(torch.nn.Module):
 
         y = self.layers(torch.cat([c_in*x, sigma.log() / 4, torch.ones_like(sigma)], dim=-1))
         F = self.layer_mean(y) * self.gain_mean
-        G = self.layer_logvar(y) * self.gain_logvar - torch.log(c_skip)
+        G = self.layer_logvar(y) * self.gain_logvar
         G = torch.clamp(G, min=-20, max=20) 
         
         return F, G
 
     def loss(self, x_0, sigma):
 
-        x = x_0 + torch.randn_like(x_0)*sigma
-        mean, logvar = self(x, sigma)
+        epsilon = torch.randn_like(x_0)
+        x = x_0 + epsilon*sigma
+        F, G = self(x, sigma)
 
         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
-        loss = logvar*.5 + logvar.exp()*()
+        target = (sigma*x_0 - self.sigma_data**2*epsilon)/(self.sigma_data*(sigma**2+self.sigma_data**2)**.5)
+        error = F - target
+        total_error = 1+(self.sigma_data/(sigma**2+2*self.sigma_data**2))*(error**2 - 1)
 
+        loss = G*.5 + G.exp()*total_error
+
+        return loss.sum(dim=-1).mean()
 
     def logp(self, x, sigma=0):
         F, G = self(x, sigma) # self() is your forward pass
