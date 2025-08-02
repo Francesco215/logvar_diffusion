@@ -53,6 +53,8 @@ class GaussianMixture(torch.nn.Module):
         for idx, (begin, end) in enumerate(zip(phi_ranges[:-1], phi_ranges[1:])):
             self._sample_lut[begin : end] = idx
 
+        print("Initialized GaussianMixture")
+
     # Evaluate the terms needed for calculating PDF and score.
     def _eval(self, x, sigma=0):                                                    # x: [..., dim], sigma: [...]
         L = self._L + sigma[..., None, None] ** 2                                  # L' = L + sigma * I: [..., dim]
@@ -176,13 +178,13 @@ class ToyModel(torch.nn.Module):
         super().__init__()
         self.sigma_data = sigma_data
         self.layers = torch.nn.Sequential()
-        self.layers.append(MPLinear(in_dim + 2, hidden_dim))
+        self.layers.append(torch.nn.Linear(in_dim + 2, hidden_dim))
         for _layer_idx in range(num_layers):
             self.layers.append(MPSiLU())
-            self.layers.append(MPLinear(hidden_dim, hidden_dim))
+            self.layers.append(torch.nn.Linear(hidden_dim, hidden_dim))
         self.layers.append(MPSiLU())
-        self.layer_mean = MPLinear(hidden_dim, 2)
-        self.layer_logvar = MPLinear(hidden_dim, 2)
+        self.layer_mean =   torch.nn.Linear(hidden_dim, 2)
+        self.layer_logvar = torch.nn.Linear(hidden_dim, 2)
 
         self.gain_mean  = torch.nn.Parameter(torch.zeros([]))
         self.gain_logvar= torch.nn.Parameter(torch.zeros([]))
@@ -191,23 +193,46 @@ class ToyModel(torch.nn.Module):
         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
 
         c_skip = self.sigma_data/(sigma**2 + self.sigma_data**2)
-        c_out = sigma*self.sigma_data*(sigma**2 + self.sigma_data**2)**-.5
-        x_in = x / (self.sigma_data ** 2 + sigma ** 2).sqrt()
+        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
 
-        y = self.layers(torch.cat([x_in, sigma.log() / 4, torch.ones_like(sigma)], dim=-1))
+        y = self.layers(torch.cat([c_in*x, sigma.log() / 4, torch.ones_like(sigma)], dim=-1))
         F = self.layer_mean(y) * self.gain_mean
-        logvar = self.layer_logvar(y) * self.gain_logvar + 2*(sigma+1e-4).log()
-
-        mean = x*c_skip + F*c_out
+        G = self.layer_logvar(y) * self.gain_logvar - torch.log(c_skip)
+        G = torch.clamp(G, min=-20, max=20) 
         
-        return mean, logvar
+        return F, G
 
+    def loss(self, x_0, sigma):
+
+        x = x_0 + torch.randn_like(x_0)*sigma
+        mean, logvar = self(x, sigma)
+
+        sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
+        loss = logvar*.5 + logvar.exp()*()
 
 
     def logp(self, x, sigma=0):
-        mean, logvar = self(x,sigma)
-        logprob = .5*logvar + .5*(mean-x)**2*torch.exp(-logvar) 
-        return logprob.sum(dim=-1)
+        F, G = self(x, sigma) # self() is your forward pass
+        
+        # Ensure sigma has the correct shape for broadcasting
+        sigma_t = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1) 
+        
+        # This is the target for F_theta when x = x̃, as we derived
+        target = x * sigma_t / (self.sigma_data * (sigma_t**2 + self.sigma_data**2)**0.5)
+        
+        # The squared norm || F - target ||^2
+        # For vectors, this would be a sum over the feature dimension
+        norm_sq = torch.sum((F - target)**2, dim=-1, keepdim=True)
+
+        # The coefficient from the formula
+        coeff = self.sigma_data**2 / (sigma_t**2 + 2 * self.sigma_data**2)
+        
+        # Assemble the log-probability according to the formula
+        # log q = -0.5*G - 0.5 * exp(-G) * coeff * ||...||^2
+        log_prob_per_dim = -0.5 * G - 0.5 * torch.exp(-G) * coeff * norm_sq
+        
+        # Sum the log-probabilities over the feature dimension
+        return log_prob_per_dim.sum(dim=-1)
 
     def pdf(self, x, sigma=0):
         logp = self.logp(x, sigma=sigma)
