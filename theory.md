@@ -194,7 +194,11 @@ $$
 > Hint
 > If you want to verify this formula, first substituite $\sigma_\phi$ and then substituite $\mu_\theta$
 
+Using this parametrization we can re-write the log prob
 
+$$
+\log q(x|\tilde x) =- \frac{1}{2} \left[G_\phi + e^{-G_\phi} \left( \frac{\sigma_\textrm{data}^2}{\sigma^2 + 2\sigma_\textrm{data}^2} \right) \left\| F_{\theta} - \frac{x - c_\textrm{skip} \cdot \tilde x}{c_\textrm{out}} \right\|^2+ \log(2\pi c_\textrm{var}^2)\right]
+$$
 
 # Solving the ODE
 
@@ -227,7 +231,7 @@ $$d\mathbf{x} = \left[ \mathbf{f}(\mathbf{x},t) - \frac{1}{2} g(t)^2 \nabla_{\ma
 
 For our VE SDE, the drift $\mathbf{f}(\mathbf{x}, t)$ is zero and $g(t)^2 = \frac{d[\sigma(t)^2]}{dt}$. Plugging these in and using the score function $s_\theta(x, t) = \nabla_{\mathbf{x}} \log p_t(\mathbf{x})$:
 
-$$d\mathbf{x} = -\frac{1}{2} \left( \frac{d[\sigma(t)^2]}{dt} \right) s_\theta(x, t) dt = -\sigma \frac{d\sigma}{dt} s_\theta(x, t) dt$$
+$$d\mathbf{x} =  \left( \frac{d[\sigma(t)^2]}{dt} \right) s_\theta(x, t) dt = -\sigma \frac{d\sigma}{dt} s_\theta(x, t) dt$$
 
 To get the final ODE, we change the variable of integration from time $t$ to the noise level $\sigma$, which yields:
 
