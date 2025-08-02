@@ -175,17 +175,21 @@ class ToyModel(torch.nn.Module):
         super().__init__()
         self.sigma_data = sigma_data
         self.layers = torch.nn.Sequential()
-        self.layers.append(MPLinear(in_dim + 2, hidden_dim))
+        self.layers.append(torch.nn.Linear(in_dim + 2, hidden_dim))
         for _layer_idx in range(num_layers):
             self.layers.append(MPSiLU())
-            self.layers.append(MPLinear(hidden_dim, hidden_dim))
+            self.layers.append(torch.nn.Linear(hidden_dim, hidden_dim))
+        self.layers.append(MPSiLU())
+        self.layers.append(torch.nn.Linear(hidden_dim, 2))
         self.gain = torch.nn.Parameter(torch.zeros([]))
 
     def forward(self, x, sigma=0):
         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
-        x = x / (self.sigma_data ** 2 + sigma ** 2).sqrt()
-        y = self.layers(torch.cat([x, sigma.log() / 4, torch.ones_like(sigma)], dim=-1))
-        z = (y ** 2).mean(-1) * self.gain / sigma.squeeze(-1) - 0.5 * (x ** 2).sum(-1) # preconditioning
+        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
+        y = self.layers(torch.cat([c_in*x, sigma.log() / 4, torch.ones_like(sigma)], dim=-1))
+        c_skip = self.sigma_data/(sigma**2 + self.sigma_data**2)
+        c_out = sigma*self.sigma_data*(sigma**2 + self.sigma_data**2)**-.5
+        z = (y - x*(1-c_skip)/c_out).sum(-1) # preconditioning
         return z
 
     def logp(self, x, sigma=0):

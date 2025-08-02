@@ -460,25 +460,26 @@ def train(new, sm, outdir, cls, layers, dim, viz, device):
 @cmdline.command()
 @click.option('--net',      help='Main model checkpoint', metavar='PATH', type=str, required=True)
 @click.option('--gnet',     help='Guiding model checkpoint', metavar='PATH',type=str, default=None)
+@click.option('--new',      help='Use the new model architecture?', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--guidance', help='Guidance weight', metavar='FLOAT', type=float, default=3, show_default=True)
 @click.option('--save',     help='Save figure, do not display', metavar='PNG|PDF', type=str, default=None)
 @click.option('--layers',   help='Number of layers in loaded models', metavar='INT', type=int, default=4, show_default=True)
 @click.option('--dim',      help='Hidden dimension of loaded models', metavar='INT', type=int, default=64, show_default=True)
 @click.option('--device',   help='PyTorch device', type=str, default=default_device)
-def plot(net, gnet, guidance, save, layers, dim, device):
+def plot(net, gnet, new, guidance, save, layers, dim, device):
     """Visualize sampling distributions with and without guidance."""
     print('Loading models...')
     device = torch.device(device)
 
     # MODIFIED: Replaced pickle/dnnlib with torch.load and model instantiation
-    main_net = ToyModel(num_layers=layers, hidden_dim=dim).to(device)
+    main_net = ToyModel(num_layers=layers, hidden_dim=dim, new=new).to(device)
     main_net.load_state_dict(torch.load(net, map_location=device))
     main_net.eval()
 
     guiding_net = None
     if gnet is not None:
         # For simplicity, assumes guiding net has same architecture.
-        guiding_net = ToyModel(num_layers=layers, hidden_dim=dim).to(device)
+        guiding_net = ToyModel(num_layers=layers, hidden_dim=dim, new=new).to(device)
         guiding_net.load_state_dict(torch.load(gnet, map_location=device))
         guiding_net.eval()
 
