@@ -22,7 +22,12 @@ import tqdm
 
 
 warnings.filterwarnings('ignore', 'You are using `torch.load` with `weights_only=False`')
-default_device = 'mps'
+if torch.cuda.is_available():
+    default_device = 'cuda'
+elif torch.backends.mps.is_available():
+    default_device = 'mps'
+else:
+    default_device = 'cpu' 
 
 #----------------------------------------------------------------------------
 # Multivariate mixture of Gaussians. Allows efficient evaluation of the
@@ -181,18 +186,28 @@ class ToyModel(torch.nn.Module):
         return F, G
 
     def loss(self, x_0, sigma):
+        x_0 = x_0.detach()
+        sigma = sigma.detach()
         epsilon = torch.randn_like(x_0)
-        x = x_0 + epsilon*sigma
+        s = torch.as_tensor(sigma, dtype=torch.float32, device=x_0.device).broadcast_to(x_0.shape[:-1]).unsqueeze(-1)
+        x = x_0 + epsilon*s
         F, G = self(x, sigma)
 
         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
         target = (sigma*x_0 - self.sigma_data**2*epsilon)/(self.sigma_data*(sigma**2+self.sigma_data**2)**.5)
         error = F - target
-        if not self.new: return error
+        if not self.new: return (error**2).sum(-1).mean()
         
-        total_error = 1+(self.sigma_data/(sigma**2+2*self.sigma_data**2))*(error**2 - 1)
-
-        loss = G*.5 + G.exp()*total_error
+        # The term (F - target)**2 is error**2
+        # The formula is G + exp(-G) * [1 + (sigma_data**2 / (sigma**2 + 2*sigma_data**2)) * (error**2 - 1)]
+        # Let's implement that.
+        
+        coeff = self.sigma_data**2 / (sigma**2 + 2 * self.sigma_data**2)
+        # The term inside the brackets in the README formula
+        inner_term = 1 + coeff * (error**2 - 1)
+        
+        # The full loss from the README
+        loss = G + torch.exp(-G) * inner_term
 
         return loss.sum(dim=-1).mean()
 
@@ -226,15 +241,16 @@ class ToyModel(torch.nn.Module):
         return pdf
 
     def score(self, x, sigma=0, graph=False):
-        x = x.detach().requires_grad_(True)
-        logp = self.logp(x, sigma=sigma)
-        score = torch.autograd.grad(outputs=[logp.sum()], inputs=[x], create_graph=graph)[0]
+        with torch.enable_grad():
+            x = x.detach().requires_grad_(True)
+            logp = self.logp(x, sigma=sigma)
+            score = torch.autograd.grad(outputs=[logp.sum()], inputs=[x], create_graph=graph)[0]
         return score
 
 #----------------------------------------------------------------------------
 # Train a 2D toy model with the given parameters.
 
-def do_train(new=False,
+def do_train(new=False, score_matching=True,
     classes='A', num_layers=4, hidden_dim=64, batch_size=4<<10, total_iter=4<<10, seed=0,
     P_mean=-2.3, P_std=1.5, sigma_data=0.5, lr_ref=1e-2, lr_iter=512, ema_decay=0.99,
     pkl_pattern=None, pkl_iter=256, viz_iter=32,
@@ -246,7 +262,7 @@ def do_train(new=False,
     net = ToyModel(num_layers=num_layers, hidden_dim=hidden_dim, sigma_data=sigma_data, new=new).to(device).train().requires_grad_(True)
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     opt = torch.optim.Adam(net.parameters(), betas=(0.9, 0.99))
-
+    print(f"score matching {score_matching}")
     # Initialize plot.
     if viz_iter is not None:
         plt.ion()
@@ -271,13 +287,30 @@ def do_train(new=False,
         opt.param_groups[0]['lr'] = lr_ref / np.sqrt(max(iter_idx / lr_iter, 1))
         opt.zero_grad()
         sigma = (torch.randn(batch_size, device=device) * P_std + P_mean).exp()
-        samples = gt(classes, device).sample((batch_size,), sigma)
-        gt_scores = gt(classes, device).score(samples, sigma)
-        net_scores = net.score(samples, sigma, graph=True)
-        loss = (sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)
-        loss.mean().backward()
-        pbar.set_postfix_str(f"Score-Matching Loss: {loss.mean().item():.3f}")
-        opt.step()
+
+        clean_samples = gt(classes, device).sample((batch_size,))
+        epsilon = torch.randn_like(clean_samples)
+        s = sigma.unsqueeze(-1)
+        noisy_samples = clean_samples + epsilon * s
+
+        if score_matching:
+            gt_scores = gt(classes, device).score(noisy_samples, sigma)
+            net_scores = net.score(noisy_samples, sigma, graph=True)
+            score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)).mean()
+            score_matching_loss.backward()
+            opt.step()
+            with torch.no_grad():
+                nll = net.loss(clean_samples, sigma)
+        else:
+            nll = net.loss(clean_samples, sigma)
+            nll.backward()
+            opt.step()
+            with torch.no_grad():
+                gt_scores = gt(classes, device).score(noisy_samples, sigma)
+                net_scores = net.score(noisy_samples, sigma, graph=False)
+                score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)).mean()
+
+        pbar.set_postfix_str(f"Score-Matching Loss: {score_matching_loss.item():.3f}, Negative Log-Likelyhood Loss: {nll.item():.3f}")
 
         # Update EMA.
         # MODIFIED: Replaced phema with a standard fixed EMA decay.
@@ -402,14 +435,15 @@ def cmdline():
 # 'train' subcommand.
 
 @cmdline.command()
-@click.option('--new',      help='Does it use the new method?', metavar='BOOL', type=str,  default=True)
+@click.option('--new',      help='Does it use the new method?', metavar='BOOL', type=bool,  default=True)
+@click.option('--sm',       help='Score Matching', metavar='BOOL',              type=bool,  default=True)
 @click.option('--outdir',   help='Output directory', metavar='DIR',             type=str,  default='training-runs')
 @click.option('--cls',      help='Target classes', metavar='A|B|AB',            type=str,  default='A', show_default=True)
 @click.option('--layers',   help='Number of layers', metavar='INT',             type=int,  default=4, show_default=True)
 @click.option('--dim',      help='Hidden dimension', metavar='INT',             type=int,  default=64, show_default=True)
 @click.option('--viz',      help='Visualize progress?', metavar='BOOL',         type=bool, default=True, show_default=True)
 @click.option('--device',   help='PyTorch device',                              type=str,  default=default_device)
-def train(new, outdir, cls, layers, dim, viz, device):
+def train(new, sm, outdir, cls, layers, dim, viz, device):
     """Train a 2D toy model with the given parameters."""
     print(f'Will save snapshots to {outdir}')
     os.makedirs(outdir, exist_ok=True)
@@ -417,7 +451,7 @@ def train(new, outdir, cls, layers, dim, viz, device):
     pkl_pattern = os.path.join(outdir, 'iter_%04d.pt')
     viz_iter = 32 if viz else None
     print('Training...')
-    do_train(new=new, pkl_pattern=pkl_pattern, classes=cls, num_layers=layers, hidden_dim=dim, viz_iter=viz_iter, device=torch.device(device))
+    do_train(new=new, score_matching=sm, pkl_pattern=pkl_pattern, classes=cls, num_layers=layers, hidden_dim=dim, viz_iter=viz_iter, device=torch.device(device))
     print('Done.')
 
 #----------------------------------------------------------------------------
