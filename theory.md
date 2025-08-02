@@ -165,26 +165,34 @@ Training a model to predict directly $\mu_\theta$ and $\sigma_\phi$ is far from 
 
 $$
 \begin{cases}
-\mu_\theta(x, \sigma, \sigma_\phi) = c_\textrm{skip}\cdot x + c_\textrm{out}\cdot F_\theta(c_\textrm{in}\cdot x,c_\textrm{noise})\\
-\sigma_\phi(x,\sigma) = \sigma\cdot\exp\left[\frac 12 G_\phi(c_\textrm{in}\cdot x, c_\textrm{noise})\right]
+\mu_\theta(x, \sigma) = c_\textrm{skip}\cdot x + c_\textrm{out}\cdot F_\theta(c_\textrm{in}\cdot x,c_\textrm{noise})\\
+\sigma_\phi(x,\sigma) = c_\textrm{var}\cdot\exp\left[\frac 12 G_\phi(c_\textrm{in}\cdot x, c_\textrm{noise})\right]
 \end{cases}
 $$
-Where $(F_\theta,G_\phi)$ is the actual neural network output, and 
+Where $(F_\theta,G_\phi)$ is the actual neural network output, and $c_\textrm{skip},\ c_\textrm{out},\ c_\textrm{in},\ c_\textrm{noise}$ are equal to 
+
 $$
 \begin{cases}
 c_\textrm{skip}(\sigma) = \sigma_\textrm{data}/(\sigma^2 + \sigma_\textrm{data}^2)\\
 c_\textrm{out}(\sigma) = \sigma\cdot \sigma_\textrm{data}/\sqrt{\sigma^2 + \sigma_\textrm{data}^2}\\
 c_\textrm{in}(\sigma) = 1/\sqrt{\sigma^2 + \sigma_\textrm{data}^2}\\
-c_\textrm{noise}=\frac 14 \log\sigma
+c_\textrm{noise}(\sigma)=\frac 14 \log\sigma\\
+c_\textrm{var}(\sigma) =  \sigma\sqrt{1 + \frac{\sigma_\textrm{data}^2}{\sigma^2+\sigma_\textrm{data}^2}}
 \end{cases}
 $$
 
-### Simplified Loss
+we can now plug all of this in the original loss formula
 $$
-L = G_\phi +e^{-G_\phi}\left(1 + \frac{(\mu_\theta-x_0)^2}{\sigma^2}\right) + \log(2\pi\sigma^2)
+L = \frac{1}{2} \left[\log \sigma_\phi^2 + \frac{\sigma^2 + (\mu_\theta - x_0)^2}{\sigma_\phi^2} + \log(2\pi) \right]
 $$
 
+Substituiting this into the original formula of the loss we get the new numerically stable loss for $\sigma\to 0$ and $\sigma \to \infty$.
 
+$$
+L = G_\phi +e^{-G_\phi}\left[1+ \frac{\sigma^2_\textrm{data}}{\sigma^2 + 2\sigma^2_\textrm{data}}\left(\left\| F_{\theta} - \frac{\sigma x_0 - \sigma_\textrm{data}^2 \epsilon}{\sigma_\textrm{data}\sqrt{\sigma^2 + \sigma_\textrm{data}^2}} \right\|^2-1\right)\right]
+$$
+> Hint
+> If you want to verify this formula, first substituite $\sigma_\phi$ and then substituite $\mu_\theta$
 
 
 
