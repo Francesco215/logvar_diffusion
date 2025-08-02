@@ -53,7 +53,6 @@ class GaussianMixture(torch.nn.Module):
         for idx, (begin, end) in enumerate(zip(phi_ranges[:-1], phi_ranges[1:])):
             self._sample_lut[begin : end] = idx
 
-        print("Initialized GaussianMixture")
 
     # Evaluate the terms needed for calculating PDF and score.
     def _eval(self, x, sigma=0):                                                    # x: [..., dim], sigma: [...]
@@ -134,35 +133,10 @@ def gt(classes='A', device=torch.device('cpu'), seed=2, origin=np.array([0.0030,
     # Construct a GaussianMixture object for the selected classes.
     sel = [c for c in comps if c['cls'] in classes]
     distrib = GaussianMixture([c['phi'] for c in sel], [c['mu'] for c in sel], [c['Sigma'] for c in sel])
+
+    print("Initialized GaussianMixture")
     return distrib.to(device)
 
-#----------------------------------------------------------------------------
-# Low-level primitives used by ToyModel.
-
-def normalize(x, dim=None, eps=1e-4):
-    if dim is None:
-        dim = list(range(1, x.ndim))
-    norm = torch.linalg.vector_norm(x, dim=dim, keepdim=True, dtype=torch.float32)
-    norm = torch.add(eps, norm, alpha=np.sqrt(norm.numel() / x.numel()))
-    return x / norm.to(x.dtype)
-
-# REMOVED: @persistence.persistent_class decorator
-class MPSiLU(torch.nn.Module):
-    def forward(self, x):
-        return torch.nn.functional.silu(x) / 0.596
-
-# REMOVED: @persistence.persistent_class decorator
-class MPLinear(torch.nn.Module):
-    def __init__(self, in_dim, out_dim):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.randn(out_dim, in_dim))
-
-    def forward(self, x):
-        if self.training:
-            with torch.no_grad():
-                self.weight.copy_(normalize(self.weight))
-        w = normalize(self.weight) / np.sqrt(self.weight[0].numel())
-        return x @ w.t()
 
 #----------------------------------------------------------------------------
 # Denoiser model for learning 2D toy distributions.
@@ -170,40 +144,43 @@ class MPLinear(torch.nn.Module):
 # REMOVED: @persistence.persistent_class decorator
 class ToyModel(torch.nn.Module):
     def __init__(self,
-        in_dim      = 2,    # Input dimensionality.
-        num_layers  = 4,    # Number of hidden layers.
-        hidden_dim  = 64,   # Number of hidden features.
-        sigma_data  = 0.5,  # Expected standard deviation of the training data.
+        in_dim      = 2,      # Input dimensionality.
+        num_layers  = 4,      # Number of hidden layers.
+        hidden_dim  = 64,     # Number of hidden features.
+        sigma_data  = 0.5,    # Expected standard deviation of the training data.
+        new         = False,  # Whether to use the old version of the code or not
     ):
         super().__init__()
         self.sigma_data = sigma_data
         self.layers = torch.nn.Sequential()
         self.layers.append(torch.nn.Linear(in_dim + 2, hidden_dim))
         for _layer_idx in range(num_layers):
-            self.layers.append(MPSiLU())
+            self.layers.append(torch.nn.SiLU())
             self.layers.append(torch.nn.Linear(hidden_dim, hidden_dim))
-        self.layers.append(MPSiLU())
-        self.layer_mean =   torch.nn.Linear(hidden_dim, 2)
-        self.layer_logvar = torch.nn.Linear(hidden_dim, 2)
+        self.layers.append(torch.nn.SiLU())
 
+        self.layer_mean =   torch.nn.Linear(hidden_dim, 2)
         self.gain_mean  = torch.nn.Parameter(torch.zeros([]))
-        self.gain_logvar= torch.nn.Parameter(torch.zeros([]))
+
+        if new:
+            self.layer_logvar = torch.nn.Linear(hidden_dim, 2)
+            self.gain_logvar= torch.nn.Parameter(torch.zeros([]))
+        self.new=new
 
     def forward(self, x, sigma=0):
         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
-
-        c_skip = self.sigma_data/(sigma**2 + self.sigma_data**2)
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
 
         y = self.layers(torch.cat([c_in*x, sigma.log() / 4, torch.ones_like(sigma)], dim=-1))
         F = self.layer_mean(y) * self.gain_mean
+        if not self.new: return F, None
+
         G = self.layer_logvar(y) * self.gain_logvar
         G = torch.clamp(G, min=-20, max=20) 
         
         return F, G
 
     def loss(self, x_0, sigma):
-
         epsilon = torch.randn_like(x_0)
         x = x_0 + epsilon*sigma
         F, G = self(x, sigma)
@@ -211,6 +188,8 @@ class ToyModel(torch.nn.Module):
         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
         target = (sigma*x_0 - self.sigma_data**2*epsilon)/(self.sigma_data*(sigma**2+self.sigma_data**2)**.5)
         error = F - target
+        if not self.new: return error
+        
         total_error = 1+(self.sigma_data/(sigma**2+2*self.sigma_data**2))*(error**2 - 1)
 
         loss = G*.5 + G.exp()*total_error
@@ -218,7 +197,7 @@ class ToyModel(torch.nn.Module):
         return loss.sum(dim=-1).mean()
 
     def logp(self, x, sigma=0):
-        F, G = self(x, sigma) # self() is your forward pass
+        F, G = self(x, sigma) 
         
         # Ensure sigma has the correct shape for broadcasting
         sigma_t = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1) 
@@ -228,14 +207,15 @@ class ToyModel(torch.nn.Module):
         
         # The squared norm || F - target ||^2
         # For vectors, this would be a sum over the feature dimension
-        norm_sq = torch.sum((F - target)**2, dim=-1, keepdim=True)
+        error = (F - target)**2
+        if not self.new: return .5*(error/sigma_t**2).sum(dim=-1)
 
         # The coefficient from the formula
         coeff = self.sigma_data**2 / (sigma_t**2 + 2 * self.sigma_data**2)
         
         # Assemble the log-probability according to the formula
         # log q = -0.5*G - 0.5 * exp(-G) * coeff * ||...||^2
-        log_prob_per_dim = -0.5 * G - 0.5 * torch.exp(-G) * coeff * norm_sq
+        log_prob_per_dim = -.5 * G -.5*torch.exp(-G) * coeff * error
         
         # Sum the log-probabilities over the feature dimension
         return log_prob_per_dim.sum(dim=-1)
@@ -254,7 +234,7 @@ class ToyModel(torch.nn.Module):
 #----------------------------------------------------------------------------
 # Train a 2D toy model with the given parameters.
 
-def do_train(
+def do_train(new=False,
     classes='A', num_layers=4, hidden_dim=64, batch_size=4<<10, total_iter=4<<10, seed=0,
     P_mean=-2.3, P_std=1.5, sigma_data=0.5, lr_ref=1e-2, lr_iter=512, ema_decay=0.99,
     pkl_pattern=None, pkl_iter=256, viz_iter=32,
@@ -263,7 +243,7 @@ def do_train(
     torch.manual_seed(seed)
 
     # Initialize model.
-    net = ToyModel(num_layers=num_layers, hidden_dim=hidden_dim, sigma_data=sigma_data).to(device).train().requires_grad_(True)
+    net = ToyModel(num_layers=num_layers, hidden_dim=hidden_dim, sigma_data=sigma_data, new=new).to(device).train().requires_grad_(True)
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     opt = torch.optim.Adam(net.parameters(), betas=(0.9, 0.99))
 
@@ -422,13 +402,14 @@ def cmdline():
 # 'train' subcommand.
 
 @cmdline.command()
-@click.option('--outdir',   help='Output directory', metavar='DIR',      type=str, default='training-runs')
-@click.option('--cls',      help='Target classes', metavar='A|B|AB',     type=str, default='A', show_default=True)
-@click.option('--layers',   help='Number of layers', metavar='INT',      type=int, default=4, show_default=True)
-@click.option('--dim',      help='Hidden dimension', metavar='INT',      type=int, default=64, show_default=True)
-@click.option('--viz',      help='Visualize progress?', metavar='BOOL', type=bool, default=True, show_default=True)
-@click.option('--device',   help='PyTorch device', type=str, default=default_device)
-def train(outdir, cls, layers, dim, viz, device):
+@click.option('--new',      help='Does it use the new method?', metavar='BOOL', type=str,  default=True)
+@click.option('--outdir',   help='Output directory', metavar='DIR',             type=str,  default='training-runs')
+@click.option('--cls',      help='Target classes', metavar='A|B|AB',            type=str,  default='A', show_default=True)
+@click.option('--layers',   help='Number of layers', metavar='INT',             type=int,  default=4, show_default=True)
+@click.option('--dim',      help='Hidden dimension', metavar='INT',             type=int,  default=64, show_default=True)
+@click.option('--viz',      help='Visualize progress?', metavar='BOOL',         type=bool, default=True, show_default=True)
+@click.option('--device',   help='PyTorch device',                              type=str,  default=default_device)
+def train(new, outdir, cls, layers, dim, viz, device):
     """Train a 2D toy model with the given parameters."""
     print(f'Will save snapshots to {outdir}')
     os.makedirs(outdir, exist_ok=True)
@@ -436,7 +417,7 @@ def train(outdir, cls, layers, dim, viz, device):
     pkl_pattern = os.path.join(outdir, 'iter_%04d.pt')
     viz_iter = 32 if viz else None
     print('Training...')
-    do_train(pkl_pattern=pkl_pattern, classes=cls, num_layers=layers, hidden_dim=dim, viz_iter=viz_iter, device=torch.device(device))
+    do_train(new=new, pkl_pattern=pkl_pattern, classes=cls, num_layers=layers, hidden_dim=dim, viz_iter=viz_iter, device=torch.device(device))
     print('Done.')
 
 #----------------------------------------------------------------------------
