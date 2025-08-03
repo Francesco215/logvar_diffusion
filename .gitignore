@@ -2,3 +2,7 @@
 .DS_Store
 training-runs/
 **.egg-info
+**__pycache__**
+
+out
+**.png

@@ -9,11 +9,13 @@
 Dependency-free version of the original 2D toy example from the paper
 "Guiding a Diffusion Model with a Bad Version of Itself".
 """
+from src.gaussian_mixture import GaussianMixture, gt
+from src.toy_model import ToyModel
+
 
 import os
 import copy
 import warnings
-import functools
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -29,240 +31,20 @@ elif torch.backends.mps.is_available():
 else:
     default_device = 'cpu' 
 
-#----------------------------------------------------------------------------
-# Multivariate mixture of Gaussians. Allows efficient evaluation of the
-# probability density function (PDF) and score vector, as well as sampling,
-# using the GPU. The distribution can be optionally smoothed by applying heat
-# diffusion (sigma >= 0) on a per-sample basis.
-
-class GaussianMixture(torch.nn.Module):
-    def __init__(self,
-        phi,                    # Per-component weight: [comp]
-        mu,                     # Per-component mean: [comp, dim]
-        Sigma,                  # Per-component covariance matrix: [comp, dim, dim]
-        sample_lut_size = 64<<10,   # Lookup table size for efficient sampling.
-    ):
-        super().__init__()
-        self.register_buffer('phi', torch.tensor(np.asarray(phi) / np.sum(phi), dtype=torch.float32))
-        self.register_buffer('mu', torch.tensor(np.asarray(mu), dtype=torch.float32))
-        self.register_buffer('Sigma', torch.tensor(np.asarray(Sigma), dtype=torch.float32))
-
-        # Precompute eigendecompositions of Sigma for efficient heat diffusion.
-        L, Q = torch.linalg.eigh(self.Sigma) # Sigma = Q @ L @ Q
-        self.register_buffer('_L', L) # L: [comp, dim, dim]
-        self.register_buffer('_Q', Q) # Q: [comp, dim, dim]
-
-        # Precompute lookup table for efficient sampling.
-        self.register_buffer('_sample_lut', torch.zeros(sample_lut_size, dtype=torch.int64))
-        phi_ranges = (torch.cat([torch.zeros_like(self.phi[:1]), self.phi.cumsum(0)]) * sample_lut_size + 0.5).to(torch.int32)
-        for idx, (begin, end) in enumerate(zip(phi_ranges[:-1], phi_ranges[1:])):
-            self._sample_lut[begin : end] = idx
-
-
-    # Evaluate the terms needed for calculating PDF and score.
-    def _eval(self, x, sigma=0):                                                    # x: [..., dim], sigma: [...]
-        L = self._L + sigma[..., None, None] ** 2                                  # L' = L + sigma * I: [..., dim]
-        d = L.prod(-1)                                                            # d = det(Sigma') = det(Q @ L' @ Q) = det(L'): [...]
-        y = self.mu - x[..., None, :]                                             # y = mu - x: [..., comp, dim]
-        z = torch.einsum('...ij,...j,...kj,...k->...i', self._Q, 1 / L, self._Q, y) # z = inv(Sigma') @ (mu - x): [..., comp, dim]
-        c = self.phi / (((2 * np.pi) ** x.shape[-1]) * d).sqrt()                   # normalization factor of N(x; mu, Sigma')
-        w = c * (-1/2 * torch.einsum('...i,...i->...', y, z)).exp()                # w = N(x; mu, Sigma'): [..., comp]
-        return z, w
-
-    # Calculate p(x; sigma) for the given sample points, processing at most the given number of samples at a time.
-    def pdf(self, x, sigma=0, max_batch_size=1<<14):
-        sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1])
-        x_batches = x.flatten(0, -2).split(max_batch_size)
-        sigma_batches = sigma.flatten().split(max_batch_size)
-        pdf_batches = [self._eval(xx, ss)[1].sum(-1) for xx, ss in zip(x_batches, sigma_batches)]
-        return torch.cat(pdf_batches).reshape(x.shape[:-1]) # x.shape[:-1]
-
-    # Calculate log(p(x; sigma)) for the given sample points, processing at most the given number of samples at a time.
-    def logp(self, x, sigma=0, max_batch_size=1<<14):
-        return self.pdf(x, sigma, max_batch_size).log()
-
-    # Calculate \nabla_x log(p(x; sigma)) for the given sample points.
-    def score(self, x, sigma=0):
-        sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1])
-        z, w = self._eval(x, sigma)
-        w = w[..., None]
-        return (w * z).sum(-2) / w.sum(-2) # x.shape
-
-    # Draw the given number of random samples from p(x; sigma).
-    def sample(self, shape, sigma=0, generator=None):
-        sigma = torch.as_tensor(sigma, dtype=torch.float32, device=self.mu.device).broadcast_to(shape)
-        i = self._sample_lut[torch.randint(len(self._sample_lut), size=sigma.shape, device=sigma.device, generator=generator)]
-        L = self._L[i] + sigma[..., None] ** 2                                           # L' = L + sigma * I: [..., dim]
-        x = torch.randn(L.shape, device=sigma.device, generator=generator)              # x ~ N(0, I): [..., dim]
-        y = torch.einsum('...ij,...j,...kj,...k->...i', self._Q[i], L.sqrt(), self._Q[i], x)    # y = sqrt(Sigma') @ x: [..., dim]
-        return y + self.mu[i] # [..., dim]
-
-#----------------------------------------------------------------------------
-# Construct a ground truth 2D distribution for the given set of classes
-# ('A', 'B', or 'AB').
-
-@functools.lru_cache(None)
-def gt(classes='A', device=torch.device('cpu'), seed=2, origin=np.array([0.0030, 0.0325]), scale=np.array([1.3136, 1.3844])):
-    rnd = np.random.RandomState(seed)
-    comps = []
-
-    # Recursive function to generate a given branch of the distribution.
-    def recurse(cls, depth, pos, angle):
-        if depth >= 7:
-            return
-
-        # Choose parameters for the current branch.
-        dir = np.array([np.cos(angle), np.sin(angle)])
-        dist = 0.292 * (0.8 ** depth) * (rnd.randn() * 0.2 + 1)
-        thick = 0.2 * (0.8 ** depth) / dist
-        size = scale * dist * 0.06
-
-        # Represent the current branch as a sequence of Gaussian components.
-        for t in np.linspace(0.07, 0.93, num=8):
-            # MODIFIED: Replaced dnnlib.EasyDict with a standard Python dict
-            c = dict()
-            c['cls'] = cls
-            c['phi'] = dist * (0.5 ** depth)
-            c['mu'] = (pos + dir * dist * t) * scale
-            c['Sigma'] = (np.outer(dir, dir) + (np.eye(2) - np.outer(dir, dir)) * (thick ** 2)) * np.outer(size, size)
-            comps.append(c)
-
-        # Generate each child branch.
-        for sign in [1, -1]:
-            recurse(cls=cls, depth=(depth + 1), pos=(pos + dir * dist), angle=(angle + sign * (0.7 ** depth) * (rnd.randn() * 0.2 + 1)))
-
-    # Generate each class.
-    recurse(cls='A', depth=0, pos=origin, angle=(np.pi * 0.25))
-    recurse(cls='B', depth=0, pos=origin, angle=(np.pi * 1.25))
-
-    # Construct a GaussianMixture object for the selected classes.
-    sel = [c for c in comps if c['cls'] in classes]
-    distrib = GaussianMixture([c['phi'] for c in sel], [c['mu'] for c in sel], [c['Sigma'] for c in sel])
-
-    print("Initialized GaussianMixture")
-    return distrib.to(device)
-
-
-#----------------------------------------------------------------------------
-# Denoiser model for learning 2D toy distributions.
-
-# REMOVED: @persistence.persistent_class decorator
-class ToyModel(torch.nn.Module):
-    def __init__(self,
-        in_dim      = 2,      # Input dimensionality.
-        num_layers  = 4,      # Number of hidden layers.
-        hidden_dim  = 64,     # Number of hidden features.
-        sigma_data  = 0.5,    # Expected standard deviation of the training data.
-        new         = False,  # Whether to use the old version of the code or not
-    ):
-        super().__init__()
-        self.sigma_data = sigma_data
-        self.layers = torch.nn.Sequential()
-        self.layers.append(torch.nn.Linear(in_dim + 2, hidden_dim))
-        for _layer_idx in range(num_layers):
-            self.layers.append(torch.nn.SiLU())
-            self.layers.append(torch.nn.Linear(hidden_dim, hidden_dim))
-        self.layers.append(torch.nn.SiLU())
-
-        self.layer_mean =   torch.nn.Linear(hidden_dim, 2)
-        self.gain_mean  = torch.nn.Parameter(torch.zeros([]))
-
-        if new:
-            self.layer_logvar = torch.nn.Linear(hidden_dim, 2)
-            self.gain_logvar= torch.nn.Parameter(torch.zeros([])).requires_grad_(True)
-        self.new=new
-
-    def forward(self, x, sigma=0):
-        sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
-        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
-
-        y = self.layers(torch.cat([c_in*x, sigma.log() / 4, torch.ones_like(sigma)], dim=-1))
-        F = self.layer_mean(y) * self.gain_mean
-        if not self.new: return F, None
-
-        G = self.layer_logvar(y) * self.gain_logvar
-        G = torch.clamp(G, min=-20, max=20) 
-        
-        return F, G
-
-    def loss(self, x_0, sigma):
-        x_0 = x_0.detach()
-        sigma = sigma.detach()
-        epsilon = torch.randn_like(x_0)
-        s = torch.as_tensor(sigma, dtype=torch.float32, device=x_0.device).broadcast_to(x_0.shape[:-1]).unsqueeze(-1)
-        x = x_0 + epsilon*s
-        F, G = self(x, sigma)
-
-        sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
-        target = (sigma*x_0 - self.sigma_data**2*epsilon)/(self.sigma_data*(sigma**2+self.sigma_data**2)**.5)
-        error = F - target
-        if not self.new: return (error**2).sum(-1).mean()
-        
-        # The term (F - target)**2 is error**2
-        # The formula is G + exp(-G) * [1 + (sigma_data**2 / (sigma**2 + 2*sigma_data**2)) * (error**2 - 1)]
-        # Let's implement that.
-        
-        coeff = self.sigma_data**2 / (sigma**2 + 2 * self.sigma_data**2)
-        # The term inside the brackets in the README formula
-        inner_term = 1 + coeff * (error**2 - 1)
-        
-        # The full loss from the README
-        loss = G + torch.exp(-G) * inner_term
-
-        return loss.sum(dim=-1).mean()
-
-    def logp(self, x, sigma=0):
-        F, G = self(x, sigma) 
-        
-        # Ensure sigma has the correct shape for broadcasting
-        sigma_t = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1) 
-        
-        # This is the target for F_theta when x = x̃, as we derived
-        target = x * sigma_t / (self.sigma_data * (sigma_t**2 + self.sigma_data**2)**0.5)
-        
-        # The squared norm || F - target ||^2
-        # For vectors, this would be a sum over the feature dimension
-        error = (F - target)**2
-
-        if not self.new:
-            coeff = self.sigma_data**2/(sigma_t**2+self.sigma_data**2)
-            return -.5*(error*coeff).sum(dim=-1)
-
-        # The coefficient from the formula
-        coeff = self.sigma_data**2 / (sigma_t**2 + 2 * self.sigma_data**2)
-        
-        # Assemble the log-probability according to the formula
-        # log q = -0.5*G - 0.5 * exp(-G) * coeff * ||...||^2
-        log_prob_per_dim = -.5 * G -.5*torch.exp(-G) * coeff * error
-        
-        # Sum the log-probabilities over the feature dimension
-        return log_prob_per_dim.sum(dim=-1)
-
-    def pdf(self, x, sigma=0):
-        logp = self.logp(x, sigma=sigma)
-        pdf = (logp - logp.max()).exp()
-        return pdf
-
-    def score(self, x, sigma=0, graph=False):
-        with torch.enable_grad():
-            x = x.detach().requires_grad_(True)
-            logp = self.logp(x, sigma=sigma)
-            score = torch.autograd.grad(outputs=[logp.sum()], inputs=[x], create_graph=graph)[0]
-        return score
-
+torch.autograd.set_detect_anomaly(True)
 #----------------------------------------------------------------------------
 # Train a 2D toy model with the given parameters.
 
 def do_train(new=False, score_matching=True,
     classes='A', num_layers=4, hidden_dim=64, batch_size=4<<10, total_iter=4<<10, seed=0,
-    P_mean=-2.3, P_std=1.5, sigma_data=0.5, lr_ref=1e-2, lr_iter=512, ema_decay=0.99,
+    P_mean=-2.3, P_std=1.5, sigma_data=0.5, lr_ref=1e-4, lr_iter=512, ema_decay=0.99,
     pkl_pattern=None, pkl_iter=256, viz_iter=32,
     device=torch.device(default_device),
 ):
     torch.manual_seed(seed)
 
     # Initialize model.
-    net = ToyModel(num_layers=num_layers, hidden_dim=hidden_dim, sigma_data=sigma_data, new=new).to(device).train().requires_grad_(True)
+    net = ToyModel(num_layers=num_layers, hidden_dim=hidden_dim, sigma_data=sigma_data, new=new).to(device).train()
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     opt = torch.optim.Adam(net.parameters(), betas=(0.9, 0.99))
     print(f"score matching {score_matching}")
@@ -292,23 +74,20 @@ def do_train(new=False, score_matching=True,
         opt.zero_grad()
         sigma = (torch.randn(batch_size, device=device) * P_std + P_mean).exp()
 
-        clean_samples = gt(classes, device).sample((batch_size,))
+        clean_samples, Sigma = gt(classes, device).sample((batch_size,), torch.zeros_like(sigma))
         epsilon = torch.randn_like(clean_samples)
-        s = sigma.unsqueeze(-1)
-        noisy_samples = clean_samples + epsilon * s
+        noisy_samples = clean_samples + epsilon * sigma.unsqueeze(-1)
 
         if score_matching:
             gt_scores = gt(classes, device).score(noisy_samples, sigma)
             net_scores = net.score(noisy_samples, sigma, graph=True)
             score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)).mean()
             score_matching_loss.backward()
-            opt.step()
             with torch.no_grad():
-                nll = net.loss(clean_samples, sigma)
+                nll = net.loss(clean_samples, sigma, Sigma)
         else:
-            nll = net.loss(clean_samples, sigma)
+            nll = net.loss(clean_samples, sigma, Sigma)
             nll.backward()
-            opt.step()
             if iter_idx%16==0:
                 with torch.no_grad():
                     gt_scores = gt(classes, device).score(noisy_samples, sigma)
@@ -316,6 +95,7 @@ def do_train(new=False, score_matching=True,
                     score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)).mean()
 
         pbar.set_postfix_str(f"Score-Matching Loss: {score_matching_loss.item():.3f}, Negative Log-Likelyhood Loss: {nll.item():.3f}")
+        opt.step()
 
         # Update EMA.
         # MODIFIED: Replaced phema with a standard fixed EMA decay.
