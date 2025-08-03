@@ -91,24 +91,16 @@ class GaussianMixture(torch.nn.Module):
 
     # Draw the given number of random samples from p(x; sigma).
     torch.no_grad()
+    # Draw the given number of random samples from p(x; sigma).
     def sample(self, shape, sigma=0, generator=None):
         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=self.mu.device).broadcast_to(shape)
         i = self._sample_lut[torch.randint(len(self._sample_lut), size=sigma.shape, device=sigma.device, generator=generator)]
-        L, Q = self._L[i], self._Q[i]
-        rand_1 = torch.randn(L.shape, device=sigma.device, generator=generator)              # x ~ N(0, I): [..., dim]
-        rand_2 = torch.randn(L.shape, device=sigma.device, generator=generator)              # x ~ N(0, I): [..., dim]
-        y = einops.einsum(Q, L.sqrt()*rand_1,'... i j, ... j -> ... j')+sigma.unsqueeze(-1)*rand_2 
-        Sigma = torch.einsum('... i k,... k,... j k -> ... i j', Q, L + sigma.unsqueeze(-1)**2, Q)
-        return y + self.mu[i], Sigma # [..., dim]
+        L = self._L[i] + sigma[..., None] ** 2                                           # L' = L + sigma * I: [..., dim]
+        x = torch.randn(L.shape, device=sigma.device, generator=generator)              # x ~ N(0, I): [..., dim]
+        y = torch.einsum('...ij,...j,...kj,...k->...i', self._Q[i], L.sqrt(), self._Q[i], x)    # y = sqrt(Sigma') @ x: [..., dim]
+        return y + self.mu[i], None # [..., dim]
 
-    def sample_gaussian(self, shape, generator=None, device = "cpu"):
-        i = self._sample_lut[torch.randint(len(self._sample_lut), size=shape, device=self.mu.device, generator=generator)]
-        
-        # Retrieve the mean and covariance matrix for the sampled indices.
-        mean = self.mu[i]
-        Sigma = self.Sigma[i]
-        
-        return mean.to(device), Sigma.to(device)
+
 #----------------------------------------------------------------------------
 # Construct a ground truth 2D distribution for the given set of classes
 # ('A', 'B', or 'AB').
@@ -236,6 +228,7 @@ class ToyModel(torch.nn.Module):
         # For vectors, this would be a sum over the feature dimension
         error = (F - target)**2
 
+        # if True:
         if not self.new:
             coeff = self.sigma_data**2/(sigma_t**2+self.sigma_data**2)
             return -.5*(error*coeff).sum(dim=-1)
@@ -256,10 +249,23 @@ class ToyModel(torch.nn.Module):
         return pdf
 
     def score(self, x, sigma=0, graph=False):
-        with torch.enable_grad():
-            x = x.detach().requires_grad_(True)
-            logp = self.logp(x, sigma=sigma)
-            score = torch.autograd.grad(outputs=[logp.sum()], inputs=[x], create_graph=graph)[0]
+        F, G = self(x, sigma)
+        sigma_b = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
+
+        # --- Calculate mu_theta(x, sigma) ---
+        c_skip = self.sigma_data**2 / (sigma_b**2 + self.sigma_data**2)
+        c_out = sigma_b * self.sigma_data / (sigma_b**2 + self.sigma_data**2).sqrt()
+        mu_theta = c_skip * x + c_out * F
+
+        # --- Calculate sigma_phi(x, sigma)^2 ---
+        if self.new:
+            c_var_sq = sigma_b**2 * (sigma_b**2 + 2 * self.sigma_data**2) / (sigma_b**2 + self.sigma_data**2)
+            sigma_phi_sq = c_var_sq * torch.exp(G)
+        else:
+            sigma_phi_sq = sigma_b**2
+
+        score = (mu_theta - x) / sigma_phi_sq
+        
         return score
 
 #----------------------------------------------------------------------------
@@ -267,7 +273,7 @@ class ToyModel(torch.nn.Module):
 
 def do_train(new=False, score_matching=True,
     classes='A', num_layers=4, hidden_dim=64, batch_size=4<<10, total_iter=4<<10, seed=0,
-    P_mean=-2.3, P_std=1.5, sigma_data=0.5, lr_ref=1e-2, lr_iter=512, ema_decay=0.99,
+    P_mean=-2.4, P_std=1.5, sigma_data=0.5, lr_ref=1e-2, lr_iter=512, ema_decay=0.99,
     pkl_pattern=None, pkl_iter=256, viz_iter=32,
     device=torch.device(default_device),
 ):
