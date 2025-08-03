@@ -329,7 +329,7 @@ def do_train(new=False, score_matching=True,
             if os.path.dirname(pkl_path):
                 os.makedirs(os.path.dirname(pkl_path), exist_ok=True)
             # MODIFIED: Replaced pickle with torch.save
-            torch.save(ema.cpu().state_dict(), pkl_path)
+            torch.save({k: v.cpu() for k, v in ema.state_dict().items()}, pkl_path)
 
 
 #----------------------------------------------------------------------------
