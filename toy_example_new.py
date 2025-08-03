@@ -169,7 +169,7 @@ class ToyModel(torch.nn.Module):
 
         if new:
             self.layer_logvar = torch.nn.Linear(hidden_dim, 2)
-            self.gain_logvar= torch.nn.Parameter(torch.zeros([])).requires_grad_(False)
+            self.gain_logvar= torch.nn.Parameter(torch.zeros([])).requires_grad_(True)
         self.new=new
 
     def forward(self, x, sigma=0):
