@@ -14,6 +14,7 @@ import os
 import copy
 import warnings
 import functools
+import einops
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -89,14 +90,25 @@ class GaussianMixture(torch.nn.Module):
         return (w * z).sum(-2) / w.sum(-2) # x.shape
 
     # Draw the given number of random samples from p(x; sigma).
+    torch.no_grad()
     def sample(self, shape, sigma=0, generator=None):
         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=self.mu.device).broadcast_to(shape)
         i = self._sample_lut[torch.randint(len(self._sample_lut), size=sigma.shape, device=sigma.device, generator=generator)]
-        L = self._L[i] + sigma[..., None] ** 2                                           # L' = L + sigma * I: [..., dim]
-        x = torch.randn(L.shape, device=sigma.device, generator=generator)              # x ~ N(0, I): [..., dim]
-        y = torch.einsum('...ij,...j,...kj,...k->...i', self._Q[i], L.sqrt(), self._Q[i], x)    # y = sqrt(Sigma') @ x: [..., dim]
-        return y + self.mu[i] # [..., dim]
+        L, Q = self._L[i], self._Q[i]
+        rand_1 = torch.randn(L.shape, device=sigma.device, generator=generator)              # x ~ N(0, I): [..., dim]
+        rand_2 = torch.randn(L.shape, device=sigma.device, generator=generator)              # x ~ N(0, I): [..., dim]
+        y = einops.einsum(Q, L.sqrt()*rand_1,'... i j, ... j -> ... j')+sigma.unsqueeze(-1)*rand_2 
+        Sigma = torch.einsum('... i k,... k,... j k -> ... i j', Q, L + sigma.unsqueeze(-1)**2, Q)
+        return y + self.mu[i], Sigma # [..., dim]
 
+    def sample_gaussian(self, shape, generator=None, device = "cpu"):
+        i = self._sample_lut[torch.randint(len(self._sample_lut), size=shape, device=self.mu.device, generator=generator)]
+        
+        # Retrieve the mean and covariance matrix for the sampled indices.
+        mean = self.mu[i]
+        Sigma = self.Sigma[i]
+        
+        return mean.to(device), Sigma.to(device)
 #----------------------------------------------------------------------------
 # Construct a ground truth 2D distribution for the given set of classes
 # ('A', 'B', or 'AB').
@@ -262,7 +274,7 @@ def do_train(new=False, score_matching=True,
     torch.manual_seed(seed)
 
     # Initialize model.
-    net = ToyModel(num_layers=num_layers, hidden_dim=hidden_dim, sigma_data=sigma_data, new=new).to(device).train().requires_grad_(True)
+    net = ToyModel(num_layers=num_layers, hidden_dim=hidden_dim, sigma_data=sigma_data, new=new).to(device).train()
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     opt = torch.optim.Adam(net.parameters(), betas=(0.9, 0.99))
     print(f"score matching {score_matching}")
@@ -292,23 +304,20 @@ def do_train(new=False, score_matching=True,
         opt.zero_grad()
         sigma = (torch.randn(batch_size, device=device) * P_std + P_mean).exp()
 
-        clean_samples = gt(classes, device).sample((batch_size,))
+        clean_samples, _ = gt(classes, device).sample((batch_size,), torch.zeros_like(sigma))
         epsilon = torch.randn_like(clean_samples)
-        s = sigma.unsqueeze(-1)
-        noisy_samples = clean_samples + epsilon * s
+        noisy_samples = clean_samples + epsilon * sigma.unsqueeze(-1)
 
         if score_matching:
             gt_scores = gt(classes, device).score(noisy_samples, sigma)
             net_scores = net.score(noisy_samples, sigma, graph=True)
             score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)).mean()
             score_matching_loss.backward()
-            opt.step()
             with torch.no_grad():
                 nll = net.loss(clean_samples, sigma)
         else:
             nll = net.loss(clean_samples, sigma)
             nll.backward()
-            opt.step()
             if iter_idx%16==0:
                 with torch.no_grad():
                     gt_scores = gt(classes, device).score(noisy_samples, sigma)
@@ -316,6 +325,7 @@ def do_train(new=False, score_matching=True,
                     score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)).mean()
 
         pbar.set_postfix_str(f"Score-Matching Loss: {score_matching_loss.item():.3f}, Negative Log-Likelyhood Loss: {nll.item():.3f}")
+        opt.step()
 
         # Update EMA.
         # MODIFIED: Replaced phema with a standard fixed EMA decay.
@@ -381,7 +391,7 @@ def do_plot(
 ):
     # Generate initial samples.
     if any(x.startswith(y) for x in elems for y in ['samples', 'trajectories', 'scores']):
-        samples = gt('A', device).sample((num_samples,), sigma_max, generator=torch.Generator(device).manual_seed(seed))
+        samples, _ = gt('A', device).sample((num_samples,), sigma_max, generator=torch.Generator(device).manual_seed(seed))
         if sample_distance > 0:
             ok = torch.ones(len(samples), dtype=torch.bool, device=device)
             for i in range(1, len(samples)):
