@@ -99,8 +99,8 @@ class GaussianMixture(torch.nn.Module):
         L = self._L[i] + sigma[..., None] ** 2                                           # L' = L + sigma * I: [..., dim]
         Q = self._Q[i]
         x = torch.randn(L.shape, device=sigma.device, generator=generator)              # x ~ N(0, I): [..., dim]
-        y = torch.einsum('...ij,...j,...kj,...k->...i', Q[i], L.sqrt(), Q[i], x)    # y = sqrt(Sigma') @ x: [..., dim]
-        Sigma = torch.einsum('... i k,... k,... j k -> ... i j', Q[i], L + sigma.unsqueeze(-1)**2, Q)
+        y = torch.einsum('...ij,...j,...kj,...k->...i', Q, L.sqrt(), Q, x)    # y = sqrt(Sigma') @ x: [..., dim]
+        Sigma = torch.einsum('... i k,... k,... j k -> ... i j', Q, L + sigma.unsqueeze(-1)**2, Q)
         return y + self.mu[i], Sigma # [..., dim]
 
 
@@ -207,7 +207,7 @@ class ToyModel(torch.nn.Module):
         logdet, S = transform_G(G)
         error = einops.einsum(S, error, '... j i, ... j -> ... j').pow(2).sum(dim=-1)
 
-        coeff = self.sigma_data**2 / (sigma**2 * 2*self.sigma_data**2)
+        coeff = self.sigma_data**2 / (sigma**2 + 2*self.sigma_data**2)
         c_var_2 = 1+self.sigma_data**2/(sigma**2+self.sigma_data**2)
 
         error = coeff*error
@@ -282,12 +282,12 @@ class ToyModel(torch.nn.Module):
         return score
 
 def transform_G(G):
-    S = torch.zeros([G.shape[0],2,2], device = G.device, dtype = G.dtype)
-    S[:,0,0]=G[:,0].exp()
-    S[:,1,1]=G[:,1].exp()
-    S[:,0,1]=G[:,2].sinh()
+    S = torch.zeros([*G.shape[:-1],2,2], device = G.device, dtype = G.dtype)
+    S[...,0,0]=G[...,0].exp()
+    S[...,1,1]=G[...,1].exp()
+    S[...,0,1]=G[...,2].sinh()
 
-    logdet = -2*(G[:,0] + G[:,1])
+    logdet = -2*(G[...,0] + G[...,1])
 
     # the learned covariance matrix Sigma_phi^-1 = S@S^T
     return logdet, S
