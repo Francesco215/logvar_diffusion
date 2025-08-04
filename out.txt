@@ -1,0 +1,218 @@
+diff --git a/toy_example_new.py b/toy_example_new.py
+index c2fdd29..3dad70b 100644
+--- a/toy_example_new.py
++++ b/toy_example_new.py
+@@ -17,6 +17,7 @@ import functools
+ import einops
+ import numpy as np
+ import torch
++import einops
+ import matplotlib.pyplot as plt
+ import click
+ import tqdm
+@@ -90,15 +91,17 @@ class GaussianMixture(torch.nn.Module):
+         return (w * z).sum(-2) / w.sum(-2) # x.shape
+ 
+     # Draw the given number of random samples from p(x; sigma).
+-    torch.no_grad()
+     # Draw the given number of random samples from p(x; sigma).
++    torch.no_grad()
+     def sample(self, shape, sigma=0, generator=None):
+         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=self.mu.device).broadcast_to(shape)
+         i = self._sample_lut[torch.randint(len(self._sample_lut), size=sigma.shape, device=sigma.device, generator=generator)]
+         L = self._L[i] + sigma[..., None] ** 2                                           # L' = L + sigma * I: [..., dim]
++        Q = self._Q[i]
+         x = torch.randn(L.shape, device=sigma.device, generator=generator)              # x ~ N(0, I): [..., dim]
+-        y = torch.einsum('...ij,...j,...kj,...k->...i', self._Q[i], L.sqrt(), self._Q[i], x)    # y = sqrt(Sigma') @ x: [..., dim]
+-        return y + self.mu[i], None # [..., dim]
++        y = torch.einsum('...ij,...j,...kj,...k->...i', Q[i], L.sqrt(), Q[i], x)    # y = sqrt(Sigma') @ x: [..., dim]
++        Sigma = torch.einsum('... i k,... k,... j k -> ... i j', Q[i], L + sigma.unsqueeze(-1)**2, Q)
++        return y + self.mu[i], Sigma # [..., dim]
+ 
+ 
+ #----------------------------------------------------------------------------
+@@ -150,7 +153,6 @@ def gt(classes='A', device=torch.device('cpu'), seed=2, origin=np.array([0.0030,
+ #----------------------------------------------------------------------------
+ # Denoiser model for learning 2D toy distributions.
+ 
+-# REMOVED: @persistence.persistent_class decorator
+ class ToyModel(torch.nn.Module):
+     def __init__(self,
+         in_dim      = 2,      # Input dimensionality.
+@@ -168,12 +170,12 @@ class ToyModel(torch.nn.Module):
+             self.layers.append(torch.nn.Linear(hidden_dim, hidden_dim))
+         self.layers.append(torch.nn.SiLU())
+ 
+-        self.layer_mean =   torch.nn.Linear(hidden_dim, 2)
+-        self.gain_mean  = torch.nn.Parameter(torch.zeros([]))
++        self.layer_F = torch.nn.Linear(hidden_dim, 2)
++        self.gain_F  = torch.nn.Parameter(torch.zeros([]))
+ 
+         if new:
+-            self.layer_logvar = torch.nn.Linear(hidden_dim, 2)
+-            self.gain_logvar= torch.nn.Parameter(torch.zeros([])).requires_grad_(True)
++            self.layer_G = torch.nn.Linear(hidden_dim, 3)
++            self.gain_G  = torch.nn.Parameter(torch.zeros([]))
+         self.new=new
+ 
+     def forward(self, x, sigma=0):
+@@ -181,67 +183,72 @@ class ToyModel(torch.nn.Module):
+         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
+ 
+         y = self.layers(torch.cat([c_in*x, sigma.log() / 4, torch.ones_like(sigma)], dim=-1))
+-        F = self.layer_mean(y) * self.gain_mean
++        F = self.layer_F(y) * self.gain_F
+         if not self.new: return F, None
+ 
+-        G = self.layer_logvar(y) * self.gain_logvar
++        G = self.layer_G(y) * self.gain_G
+         G = torch.clamp(G, min=-20, max=20) 
+         
+         return F, G
+ 
+-    def loss(self, x_0, sigma):
+-        x_0 = x_0.detach()
+-        sigma = sigma.detach()
++
++
++    def loss(self, x_0, sigma, Sigma):
+         epsilon = torch.randn_like(x_0)
+-        s = torch.as_tensor(sigma, dtype=torch.float32, device=x_0.device).broadcast_to(x_0.shape[:-1]).unsqueeze(-1)
+-        x = x_0 + epsilon*s
++
++        x = x_0 + epsilon*sigma.unsqueeze(-1)
+         F, G = self(x, sigma)
+ 
+-        sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
++        sigma = sigma.unsqueeze(-1)
+         target = (sigma*x_0 - self.sigma_data**2*epsilon)/(self.sigma_data*(sigma**2+self.sigma_data**2)**.5)
+         error = F - target
+         if not self.new: return (error**2).sum(-1).mean()
+-        
+-        # The term (F - target)**2 is error**2
+-        # The formula is G + exp(-G) * [1 + (sigma_data**2 / (sigma**2 + 2*sigma_data**2)) * (error**2 - 1)]
+-        # Let's implement that.
+-        
+-        coeff = self.sigma_data**2 / (sigma**2 + 2 * self.sigma_data**2)
+-        # The term inside the brackets in the README formula
+-        inner_term = 1 + coeff * (error**2 - 1)
+-        
+-        # The full loss from the README
+-        loss = G + torch.exp(-G) * inner_term
++    
++        logdet, S = transform_G(G)
++        error = einops.einsum(S, error, '... j i, ... j -> ... j').pow(2).sum(dim=-1)
+ 
+-        return loss.sum(dim=-1).mean()
++        coeff = self.sigma_data**2 / (sigma**2 * 2*self.sigma_data**2)
++        c_var_2 = 1+self.sigma_data**2/(sigma**2+self.sigma_data**2)
++
++        error = coeff*error
++        Sigma_phi = einops.einsum(S,S, ' ... i j, ... k j -> ... i k')
++        Sigma_trace = einops.einsum(Sigma_phi,Sigma, '... i j, ... j i -> ...')/(sigma**2*c_var_2)
++        sigma_trace = (S**2).sum(dim=(-1,-2))/c_var_2
++    
++        # This ensures the loss is minimized correctly instead of diverging.
++        loss = .5*(error + sigma_trace + Sigma_trace + logdet)
++
++        return loss.mean()
+ 
+     def logp(self, x, sigma=0):
+         F, G = self(x, sigma) 
+         
++        logdet, S = transform_G(G)
++        
+         # Ensure sigma has the correct shape for broadcasting
+         sigma_t = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1) 
+         
+         # This is the target for F_theta when x = x̃, as we derived
+         target = x * sigma_t / (self.sigma_data * (sigma_t**2 + self.sigma_data**2)**0.5)
+-        
+-        # The squared norm || F - target ||^2
+-        # For vectors, this would be a sum over the feature dimension
+-        error = (F - target)**2
++        error = (F - target)
+ 
+         # if True:
+         if not self.new:
++            error = error**2
+             coeff = self.sigma_data**2/(sigma_t**2+self.sigma_data**2)
+             return -.5*(error*coeff).sum(dim=-1)
++            
+ 
+-        # The coefficient from the formula
+-        coeff = self.sigma_data**2 / (sigma_t**2 + 2 * self.sigma_data**2)
+-        
+         # Assemble the log-probability according to the formula
+         # log q = -0.5*G - 0.5 * exp(-G) * coeff * ||...||^2
+-        log_prob_per_dim = -.5 * G -.5*torch.exp(-G) * coeff * error
++        error = einops.einsum(S,error,'... i j, ... j -> ... j').pow(2).sum(dim=-1)
++        c_out = self.sigma_data**2 / (sigma**2 * self.sigma_data**2)
++        error = c_out*error
++
++        log_prob = -.5*(error + logdet)
+         
+         # Sum the log-probabilities over the feature dimension
+-        return log_prob_per_dim.sum(dim=-1)
++        return log_prob
+ 
+     def pdf(self, x, sigma=0):
+         logp = self.logp(x, sigma=sigma)
+@@ -259,15 +266,31 @@ class ToyModel(torch.nn.Module):
+ 
+         # --- Calculate sigma_phi(x, sigma)^2 ---
+         if self.new:
+-            c_var_sq = sigma_b**2 * (sigma_b**2 + 2 * self.sigma_data**2) / (sigma_b**2 + self.sigma_data**2)
+-            sigma_phi_sq = c_var_sq * torch.exp(G)
++            # Use the full learned covariance matrix
++            _, S = transform_G(G)
++            # The score is s(x) = Sigma_phi^-1 @ (mu_theta - x)
++            # We use solve for numerical stability: A^-1 @ b -> torch.linalg.solve(A, b)
++            score_vec = mu_theta - x
++
++            Sigma_phi = einops.einsum(S, S, 'b i j, b i k -> b j k')
++            score = torch.einsum('... i k,... j k, ... j->... i', S, S, score_vec)
+         else:
++            # Fallback to the old isotropic score
+             sigma_phi_sq = sigma_b**2
+-
+-        score = (mu_theta - x) / sigma_phi_sq
+-        
++            score = (mu_theta - x) / sigma_phi_sq
++            
+         return score
+ 
++def transform_G(G):
++    S = torch.zeros([G.shape[0],2,2], device = G.device, dtype = G.dtype)
++    S[:,0,0]=G[:,0].exp()
++    S[:,1,1]=G[:,1].exp()
++    S[:,0,1]=G[:,2].sinh()
++
++    logdet = -2*(G[:,0] + G[:,1])
++
++    # the learned covariance matrix Sigma_phi^-1 = S@S^T
++    return logdet, S
+ #----------------------------------------------------------------------------
+ # Train a 2D toy model with the given parameters.
+ 
+@@ -310,7 +333,7 @@ def do_train(new=False, score_matching=True,
+         opt.zero_grad()
+         sigma = (torch.randn(batch_size, device=device) * P_std + P_mean).exp()
+ 
+-        clean_samples, _ = gt(classes, device).sample((batch_size,), torch.zeros_like(sigma))
++        clean_samples, Sigma = gt(classes, device).sample((batch_size,), torch.zeros_like(sigma))
+         epsilon = torch.randn_like(clean_samples)
+         noisy_samples = clean_samples + epsilon * sigma.unsqueeze(-1)
+ 
+@@ -320,9 +343,9 @@ def do_train(new=False, score_matching=True,
+             score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)).mean()
+             score_matching_loss.backward()
+             with torch.no_grad():
+-                nll = net.loss(clean_samples, sigma)
++                nll = net.loss(clean_samples, sigma, Sigma)
+         else:
+-            nll = net.loss(clean_samples, sigma)
++            nll = net.loss(clean_samples, sigma, Sigma)
+             nll.backward()
+             if iter_idx%16==0:
+                 with torch.no_grad():

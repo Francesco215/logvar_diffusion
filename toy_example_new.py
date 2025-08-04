@@ -14,8 +14,10 @@ import os
 import copy
 import warnings
 import functools
+import einops
 import numpy as np
 import torch
+import einops
 import matplotlib.pyplot as plt
 import click
 import tqdm
@@ -88,46 +90,19 @@ class GaussianMixture(torch.nn.Module):
         return (w * z).sum(-2) / w.sum(-2) # x.shape
 
 
-    def sample(self, shape, sigma=0, generator=None, for_training=False):
-        """
-        Draws random samples. 
-        If for_training=True, also returns the target mean and covariance for the loss function.
-        """
-        # Ensure sigma is a tensor with the correct shape
-        sigma_t = torch.as_tensor(sigma, dtype=torch.float32, device=self.mu.device).broadcast_to(shape)
-        
-        # 1. Pick a component 'i' for each sample
-        comp_indices = self._sample_lut[torch.randint(len(self._sample_lut), size=shape, device=sigma_t.device, generator=generator)]
-        
-        # 2. Get the parameters for the chosen components
-        mu_i = self.mu[comp_indices]          # Mean of the clean component: [B, 2]
-        L_i = self._L[comp_indices]           # Eigenvalues of the clean component cov: [B, 2]
-        Q_i = self._Q[comp_indices]           # Eigenvectors of the clean component cov: [B, 2, 2]
+    # Draw the given number of random samples from p(x; sigma).
+    # Draw the given number of random samples from p(x; sigma).
+    torch.no_grad()
+    def sample(self, shape, sigma=0, generator=None):
+        sigma = torch.as_tensor(sigma, dtype=torch.float32, device=self.mu.device).broadcast_to(shape)
+        i = self._sample_lut[torch.randint(len(self._sample_lut), size=sigma.shape, device=sigma.device, generator=generator)]
+        L = self._L[i] + sigma[..., None] ** 2                                           # L' = L + sigma * I: [..., dim]
+        Q = self._Q[i]
+        x = torch.randn(L.shape, device=sigma.device, generator=generator)              # x ~ N(0, I): [..., dim]
+        y = torch.einsum('...ij,...j,...kj,...k->...i', Q, L.sqrt(), Q, x)    # y = sqrt(Sigma') @ x: [..., dim]
+        Sigma = torch.einsum('... i k,... k,... j k -> ... i j', Q, L + sigma.unsqueeze(-1)**2, Q)
+        return y + self.mu[i], Sigma # [..., dim]
 
-        # 3. Calculate the total covariance of the NOISY sample: Sigma_total = Sigma_i + sigma^2 * I
-        # This is done by adding sigma^2 to the eigenvalues before reconstructing.
-        L_total = L_i + sigma_t[..., None] ** 2  # Shape: [B, 2]
-        
-        # The full covariance matrix used to generate the sample
-        Sigma_total = torch.einsum('...ij,...jk,...lk->...il', Q_i, torch.diag_embed(L_total), Q_i)
-
-        # 4. Generate the noisy sample x_t ~ N(mu_i, Sigma_total)
-        rand_norm = torch.randn(L_total.shape, device=sigma_t.device, generator=generator) # Shape: [B, 2]
-        # Transform standard normal noise by sqrt(Sigma_total)
-        y = torch.einsum('...ij,...j,...kj,...k->...i', Q_i, L_total.sqrt(), Q_i, rand_norm)
-        noisy_sample = mu_i + y
-        
-        # If not for training, just return the sample for compatibility with plotting etc.
-        if not for_training:
-            return noisy_sample
-            
-        # For training, return the full tuple needed by the new loss function
-        # The target for the model is to predict mu_i from noisy_sample, knowing the noise
-        # had a total covariance of Sigma_total.
-        target_mean = mu_i
-        target_covariance = Sigma_total
-        
-        return noisy_sample, target_mean, target_covariance
 
 
 #----------------------------------------------------------------------------
@@ -179,7 +154,6 @@ def gt(classes='A', device=torch.device('cpu'), seed=2, origin=np.array([0.0030,
 #----------------------------------------------------------------------------
 # Denoiser model for learning 2D toy distributions.
 
-# REMOVED: @persistence.persistent_class decorator
 class ToyModel(torch.nn.Module):
     # Replace the __init__ and forward methods in your `ToyModel` class
     def __init__(self,
@@ -198,93 +172,68 @@ class ToyModel(torch.nn.Module):
             self.layers.append(torch.nn.Linear(hidden_dim, hidden_dim))
         self.layers.append(torch.nn.SiLU())
 
-        self.layer_mean = torch.nn.Linear(hidden_dim, 2)
-        self.gain_mean  = torch.nn.Parameter(torch.zeros([]))
+
+        self.layer_F = torch.nn.Linear(hidden_dim, 2)
+        self.gain_F  = torch.nn.Parameter(torch.zeros([]))
 
         if new:
-            # G now needs to output 3 values for the Cholesky factor (a, b, c)
-            self.layer_cholesky = torch.nn.Linear(hidden_dim, 3) 
-            self.gain_cholesky = torch.nn.Parameter(torch.zeros([]))
-        self.new = new
+            self.layer_G = torch.nn.Linear(hidden_dim, 3)
+            self.gain_G  = torch.nn.Parameter(torch.zeros([]))
+        self.new=new
+
 
     def forward(self, x, sigma=0):
         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
 
         y = self.layers(torch.cat([c_in*x, sigma.log() / 4, torch.ones_like(sigma)], dim=-1))
-        F = self.layer_mean(y) * self.gain_mean
-        
+
+        F = self.layer_F(y) * self.gain_F
         if not self.new: return F, None
 
-        # G is now a tensor of shape [B, 3]
-        G = self.layer_cholesky(y) * self.gain_cholesky
-        G = G.clamp(min=-20, max=20)
+        G = self.layer_G(y) * self.gain_G
+        G = torch.clamp(G, min=-20, max=20) 
         
         return F, G
 
 
-    # You can replace your existing loss function with this more efficient version.
 
-    def loss(self, noisy_x, target_mean, target_Sigma, sigma):
-        """
-        Computes the loss using the precision matrix (inverse covariance) for efficiency.
-        
-        The network now learns the Cholesky factor of P_phi = Sigma_phi^-1.
-        """
-        # Get raw network outputs F (for mean) and G (for the precision matrix's Cholesky factor)
-        F_theta, G_raw = self(noisy_x, sigma)
-        
-        # --- Original Isotropic Loss (for backward compatibility) ---
-        if not self.new:
-            # This part remains the same as it doesn't use the non-isotropic path.
-            clean_x = target_mean # In the old logic, target_mean is clean_x
-            s = sigma.unsqueeze(-1)
-            epsilon = (noisy_x - clean_x) / s
-            target = (s * clean_x - self.sigma_data**2 * epsilon) / (self.sigma_data * (s**2 + self.sigma_data**2)**0.5)
-            error = F_theta - target
-            return (error**2).sum(-1).mean()
+    def loss(self, x_0, sigma, Sigma):
+        epsilon = torch.randn_like(x_0)
 
-        # --- New Non-Isotropic Loss Calculation (using Precision Matrix) ---
-        
-        # 1. Construct the predicted mean mu_theta
-        c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
-        c_out = sigma * self.sigma_data / (sigma**2 + self.sigma_data**2).sqrt()
-        mu_theta = c_skip.unsqueeze(-1) * noisy_x + c_out.unsqueeze(-1) * F_theta
+        x = x_0 + epsilon*sigma.unsqueeze(-1)
+        F, G = self(x, sigma)
 
-        # 2. Construct the predicted precision matrix P_phi from its Cholesky factor
-        a, b_raw, c = G_raw[..., 0], G_raw[..., 1], G_raw[..., 2]
-        b = torch.sinh(b_raw)
+        sigma = sigma.unsqueeze(-1)
+        target = (sigma*x_0 - self.sigma_data**2*epsilon)/(self.sigma_data*(sigma**2+self.sigma_data**2)**.5)
+        error = F - target
+        if not self.new: return .5*(error**2).sum(-1).mean()
+    
+        logdet, S = transform_G(G)
+        error = einops.einsum(S, error, '... j i, ... j -> ... j').pow(2).sum(dim=-1)
 
-        L_P_prime = torch.zeros(noisy_x.shape[0], 2, 2, device=noisy_x.device)
-        L_P_prime[:, 0, 0] = torch.exp(a)
-        L_P_prime[:, 1, 0] = b
-        L_P_prime[:, 1, 1] = torch.exp(c)
-        
-        # Preconditioning scales the precision matrix by 1/c_var^2
-        c_var = sigma * (1 + self.sigma_data**2 / (sigma**2 + self.sigma_data**2)).sqrt()
-        P_phi = (L_P_prime @ L_P_prime.transpose(-1, -2)) / c_var.unsqueeze(-1).unsqueeze(-1)**2
+        coeff = self.sigma_data**2 / (sigma**2 + 2*self.sigma_data**2)
+        c_var_2 = 1+self.sigma_data**2/(sigma**2+self.sigma_data**2)
+
+        error = coeff*error
+        Sigma_phi = einops.einsum(S,S, ' ... i j, ... k j -> ... i k')
+        Sigma_trace = (Sigma_phi*Sigma).sum(dim=(-1,-2))/(sigma**2*c_var_2+1e-8)
+        sigma_trace = (S**2).sum(dim=(-1,-2))/c_var_2
+    
+        # This ensures the loss is minimized correctly instead of diverging.
+        loss = .5*(error + sigma_trace + Sigma_trace + logdet)
+
+        return loss.mean()
 
         # 3. Compute the KL Divergence Loss: L = 0.5 * [ tr(P_phi @ S) + err^T @ P_phi @ err - logdet(P_phi) ]
         # This avoids all matrix inversions/solves!
         
-        # Trace term: tr(P_phi @ target_Sigma)
-        trace_term = torch.vmap(torch.trace)(P_phi @ target_Sigma)
-        
-        # Error term: (mu_theta - target_mean)^T @ P_phi @ (mu_theta - target_mean)
-        error_vec = mu_theta - target_mean
-        # This is calculated with a matrix-vector product, then a dot product.
-        quad_form_vec = torch.einsum('bij,bj->bi', P_phi, error_vec)
-        mahalanobis_term = torch.einsum('bi,bi->b', error_vec, quad_form_vec)
 
-        # Log-determinant term: -log(det(P_phi))
-        # log(det(P_phi)) is easily computed from its Cholesky factor
-        log_det_P_phi = 2 * (a + c) - 2 * torch.log(c_var)
-        
-        # Combine terms. We add back the constant logdet(target_Sigma) which was part of the original KL divergence.
-        # KL(p||q) = 0.5 * [ trace + error - logdet(P_phi) - logdet(target_Sigma) - k]
-        loss_per_sample = 0.5 * (trace_term + mahalanobis_term - log_det_P_phi)
+        # Ensure sigma has the correct shape for broadcasting
+        sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
+        target = x * sigma / (self.sigma_data * (sigma**2 + self.sigma_data**2)**0.5)
+        error = (F - target)
 
-        return loss_per_sample.mean()
 
 
     def logp(self, x, sigma=0):
@@ -302,56 +251,23 @@ class ToyModel(torch.nn.Module):
 
         # --- Case 1: Original Isotropic Model (for backward compatibility) ---
         if not self.new:
-            sigma_t = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
-            target = x * sigma_t / (self.sigma_data * (sigma_t**2 + self.sigma_data**2)**0.5)
-            error_sq = (F_theta - target)**2
 
-            if G_raw is None:
-                coeff = self.sigma_data**2 / (sigma_t**2 + self.sigma_data**2)
-                logp_flat = -0.5 * (error_sq * coeff).sum(dim=-1)
-            else:
-                coeff = self.sigma_data**2 / (sigma_t**2 + 2 * self.sigma_data**2)
-                log_prob_per_dim = -0.5 * G_raw - 0.5 * torch.exp(-G_raw) * coeff * error_sq
-                logp_flat = log_prob_per_dim.sum(dim=-1)
+            error = error**2
+            coeff = self.sigma_data**2/(sigma**2+self.sigma_data**2)
+            return -.5*(error*coeff).sum(dim=-1)
             
-            # Reshape output back to original grid shape if necessary
-            if len(original_shape) > 2:
-                return logp_flat.reshape(original_shape[:-1])
-            return logp_flat
+        logdet, S = transform_G(G)
+        # Assemble the log-probability according to the formula
+        # log q = -0.5*G - 0.5 * exp(-G) * coeff * ||...||^2
+        error = einops.einsum(S, error, '... j i, ... j -> ... i').pow(2).sum(dim=-1)
+        coeff = self.sigma_data**2 / (sigma.squeeze(-1)**2 + 2*self.sigma_data**2)
+        error = coeff*error
 
-        # --- Case 2: New Non-Isotropic Model (using Precision Matrix) ---
-        sigma_t = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1])
-
-        c_skip = self.sigma_data**2 / (sigma_t**2 + self.sigma_data**2)
-        c_out = sigma_t * self.sigma_data / (sigma_t**2 + self.sigma_data**2).sqrt()
-        mu_theta = c_skip.unsqueeze(-1) * x + c_out.unsqueeze(-1) * F_theta
-
-        a, b_raw, c = G_raw[..., 0], G_raw[..., 1], G_raw[..., 2]
-        b = torch.sinh(b_raw)
-
-        L_P_prime = torch.zeros(x.shape[0], 2, 2, device=x.device)
-        L_P_prime[:, 0, 0] = torch.exp(a)
-        L_P_prime[:, 1, 0] = b
-        L_P_prime[:, 1, 1] = torch.exp(c)
+        log_prob = -.5*(error + logdet)
         
-        c_var = sigma_t * (1 + self.sigma_data**2 / (sigma_t**2 + self.sigma_data**2)).sqrt()
-        
-        P_phi = (L_P_prime @ L_P_prime.transpose(-1, -2)) / c_var.unsqueeze(-1).unsqueeze(-1)**2
+        # Sum the log-probabilities over the feature dimension
+        return log_prob
 
-        k = x.shape[-1]
-        error_vec = x - mu_theta
-
-        quad_form_vec = torch.einsum('bij,bj->bi', P_phi, error_vec)
-        quadratic_term = torch.einsum('bi,bi->b', error_vec, quad_form_vec)
-
-        log_det_P_phi = 2 * (a + c) - 2 * torch.log(c_var)
-        
-        log_prob_flat = 0.5 * (log_det_P_phi - quadratic_term - k * np.log(2 * np.pi))
-        
-        # Reshape the final output to match the original input's grid shape
-        if len(original_shape) > 2:
-            return log_prob_flat.reshape(original_shape[:-1])
-        return log_prob_flat
 
     def pdf(self, x, sigma=0):
         logp = self.logp(x, sigma=sigma)
@@ -359,18 +275,36 @@ class ToyModel(torch.nn.Module):
         return pdf
 
     def score(self, x, sigma=0, graph=False):
-        with torch.enable_grad():
-            x = x.detach().requires_grad_(True)
-            logp = self.logp(x, sigma=sigma)
-            score = torch.autograd.grad(outputs=[logp.sum()], inputs=[x], create_graph=graph)[0]
+        F, G = self(x, sigma)
+        sigma_b = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
+
+        # --- Calculate mu_theta(x, sigma) ---
+        c_skip = self.sigma_data**2 / (sigma_b**2 + self.sigma_data**2)
+        c_out = sigma_b * self.sigma_data / (sigma_b**2 + self.sigma_data**2).sqrt()
+        mu_theta = c_skip * x + c_out * F
+
+        # Fallback to the old isotropic score
+        sigma_phi_sq = sigma_b**2
+        score = (mu_theta - x) / sigma_phi_sq
+            
         return score
 
+def transform_G(G):
+    S = torch.zeros([*G.shape[:-1],2,2], device = G.device, dtype = G.dtype)
+    S[...,0,0]=G[...,0].exp()
+    S[...,1,1]=G[...,1].exp()
+    S[...,0,1]=G[...,2].sinh()
+
+    logdet = -2*(G[...,0] + G[...,1])
+
+    # the learned covariance matrix Sigma_phi^-1 = S@S^T
+    return logdet, S
 #----------------------------------------------------------------------------
 # Train a 2D toy model with the given parameters.
 
 def do_train(new=False, score_matching=True,
-    classes='A', num_layers=4, hidden_dim=64, batch_size=4<<10, total_iter=4<<10, seed=0,
-    P_mean=-2.3, P_std=1.5, sigma_data=0.5, lr_ref=1e-2, lr_iter=512, ema_decay=0.99,
+    classes='A', num_layers=4, hidden_dim=64, batch_size=4<<9, total_iter=4<<10, seed=0,
+    P_mean=-2.4, P_std=1.5, sigma_data=0.5, lr_ref=1e-2, lr_iter=512, ema_decay=0.99,
     pkl_pattern=None, pkl_iter=256, viz_iter=32,
     device=torch.device(default_device),
 ):
@@ -383,7 +317,7 @@ def do_train(new=False, score_matching=True,
     torch.manual_seed(seed)
 
     # Initialize model.
-    net = ToyModel(num_layers=num_layers, hidden_dim=hidden_dim, sigma_data=sigma_data, new=new).to(device).train().requires_grad_(True)
+    net = ToyModel(num_layers=num_layers, hidden_dim=hidden_dim, sigma_data=sigma_data, new=new).to(device).train()
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     opt = torch.optim.Adam(net.parameters(), betas=(0.9, 0.99))
     print(f"Training with new method: {new}, Score matching: {score_matching}")
@@ -412,7 +346,13 @@ def do_train(new=False, score_matching=True,
         # Execute one training iteration.
         opt.param_groups[0]['lr'] = lr_ref / np.sqrt(max(iter_idx / lr_iter, 1))
         opt.zero_grad()
-        sigma = (torch.randn(batch_size, device=device) * P_std + P_mean).exp().clamp(max=20) # Clamp sigma for stability
+
+        sigma = (torch.randn(batch_size, device=device) * P_std + P_mean).exp()
+
+        clean_samples, Sigma = gt(classes, device).sample((batch_size,), torch.zeros_like(sigma))
+        epsilon = torch.randn_like(clean_samples)
+        noisy_samples = clean_samples + epsilon * sigma.unsqueeze(-1)
+
 
         # Generate data and calculate loss based on the training method.
         if score_matching: # This path is only for the original model (new=False)
@@ -422,23 +362,14 @@ def do_train(new=False, score_matching=True,
             net_scores = net.score(noisy_samples, sigma, graph=True)
             score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).sum(-1)).mean()
             score_matching_loss.backward()
-            opt.step()
             with torch.no_grad():
-                nll = net.loss(noisy_samples, clean_samples, None, sigma)
-        else: # This path handles NLL loss for both the new and original models.
-            if new:
-                noisy_samples, target_mean, target_cov = gt(classes, device).sample((batch_size,), sigma, for_training=True)
-                nll = net.loss(noisy_samples, target_mean, target_cov, sigma)
-            else: # Original model with NLL loss
-                clean_samples = gt(classes, device).sample((batch_size,))
-                noisy_samples = clean_samples + torch.randn_like(clean_samples) * sigma.unsqueeze(-1)
-                nll = net.loss(noisy_samples, clean_samples, None, sigma)
-            
-            nll.backward()
-            opt.step()
 
-            # For logging purposes, calculate score matching loss intermittently for the original model.
-            if not new and iter_idx % 16 == 0:
+                nll = net.loss(clean_samples, sigma, Sigma)
+        else:
+            nll = net.loss(clean_samples, sigma, Sigma)
+            nll.backward()
+            if iter_idx%16==0:
+
                 with torch.no_grad():
                     gt_scores = gt(classes, device).score(noisy_samples, sigma)
                     net_scores = net.score(noisy_samples, sigma, graph=False)
@@ -446,7 +377,10 @@ def do_train(new=False, score_matching=True,
             else:
                 score_matching_loss = torch.tensor(float('nan'))
 
-        pbar.set_postfix_str(f"SM Loss: {score_matching_loss.item():.3f}, NLL Loss: {nll.item():.3f}")
+
+        pbar.set_postfix_str(f"Score-Matching Loss: {score_matching_loss.item():.3f}, Negative Log-Likelyhood Loss: {nll.item():.3f}")
+        opt.step()
+
 
         # Update EMA.
         beta = ema_decay
@@ -458,7 +392,12 @@ def do_train(new=False, score_matching=True,
             pkl_path = pkl_pattern % (iter_idx + 1)
             if os.path.dirname(pkl_path):
                 os.makedirs(os.path.dirname(pkl_path), exist_ok=True)
-            torch.save(ema.cpu().state_dict(), pkl_path)
+
+            # MODIFIED: Replaced pickle with torch.save
+            torch.save({k: v.cpu() for k, v in ema.state_dict().items()}, pkl_path)
+
+
+
 #----------------------------------------------------------------------------
 # Simulate the EDM sampling ODE for the given set of initial sample points.
 
@@ -508,7 +447,7 @@ def do_plot(
 ):
     # Generate initial samples.
     if any(x.startswith(y) for x in elems for y in ['samples', 'trajectories', 'scores']):
-        samples = gt('A', device).sample((num_samples,), sigma_max, generator=torch.Generator(device).manual_seed(seed))
+        samples, _ = gt('A', device).sample((num_samples,), sigma_max, generator=torch.Generator(device).manual_seed(seed))
         if sample_distance > 0:
             ok = torch.ones(len(samples), dtype=torch.bool, device=device)
             for i in range(1, len(samples)):
