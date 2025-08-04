@@ -202,7 +202,7 @@ class ToyModel(torch.nn.Module):
         sigma = sigma.unsqueeze(-1)
         target = (sigma*x_0 - self.sigma_data**2*epsilon)/(self.sigma_data*(sigma**2+self.sigma_data**2)**.5)
         error = F - target
-        if not self.new: return (error**2).sum(-1).mean()
+        if not self.new: return .5*(error**2).sum(-1).mean()
     
         logdet, S = transform_G(G)
         error = einops.einsum(S, error, '... j i, ... j -> ... j').pow(2).sum(dim=-1)
@@ -212,38 +212,33 @@ class ToyModel(torch.nn.Module):
 
         error = coeff*error
         Sigma_phi = einops.einsum(S,S, ' ... i j, ... k j -> ... i k')
-        Sigma_trace = einops.einsum(Sigma_phi,Sigma, '... i j, ... i j -> ...')/(sigma**2*c_var_2)
+        Sigma_trace = einops.einsum(Sigma_phi,Sigma, '... i j, ... i j -> ...')/(sigma**2*c_var_2+1e-4)
         sigma_trace = (S**2).sum(dim=(-1,-2))/c_var_2
     
         # This ensures the loss is minimized correctly instead of diverging.
-        loss = .5*(error + sigma_trace  + logdet)
+        loss = .5*(error + sigma_trace + logdet)
 
         return loss.mean()
 
     def logp(self, x, sigma=0):
         F, G = self(x, sigma) 
         
-        logdet, S = transform_G(G)
-        
         # Ensure sigma has the correct shape for broadcasting
-        sigma_t = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1) 
-        
-        # This is the target for F_theta when x = x̃, as we derived
-        target = x * sigma_t / (self.sigma_data * (sigma_t**2 + self.sigma_data**2)**0.5)
+        sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
+        target = x * sigma / (self.sigma_data * (sigma**2 + self.sigma_data**2)**0.5)
         error = (F - target)
 
-        # if True:
         if not self.new:
             error = error**2
-            coeff = self.sigma_data**2/(sigma_t**2+self.sigma_data**2)
+            coeff = self.sigma_data**2/(sigma**2+self.sigma_data**2)
             return -.5*(error*coeff).sum(dim=-1)
             
-
+        logdet, S = transform_G(G)
         # Assemble the log-probability according to the formula
         # log q = -0.5*G - 0.5 * exp(-G) * coeff * ||...||^2
-        error = einops.einsum(S,error,'... i j, ... j -> ... j').pow(2).sum(dim=-1)
-        c_out = self.sigma_data**2 / (sigma**2 * self.sigma_data**2)
-        error = c_out*error
+        error = einops.einsum(S, error, '... j i, ... j -> ... i').pow(2).sum(dim=-1)
+        coeff = self.sigma_data**2 / (sigma.squeeze(-1)**2 + 2*self.sigma_data**2)
+        error = coeff*error
 
         log_prob = -.5*(error + logdet)
         

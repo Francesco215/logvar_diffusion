@@ -9,19 +9,16 @@ def main(exp, action):
     # --- Training Commands ---
     training_experiments = {
         'baseline': 'python toy_example_new.py train --new=False --sm=False --outdir=out/baseline --viz=False',
-        'new_G_not_trained': 'python toy_example_new.py train --new=True --sm=False --outdir=out/new_G_not_trained --viz=False',
-        'new_G_trained': 'python toy_example_new.py train --new=True --sm=False --outdir=out/new_G_trained --viz=False',
-        # Note: Your code forces score_matching=False when new=True, so this will run as NLL.
-        'score_matching': 'python toy_example_new.py train --new=True --sm=True --outdir=out/score_matching --viz=False',
+        'new_method': 'python toy_example_new.py train --new=True --sm=False --outdir=out/new_method --viz=False',
+        'score_matching': 'python toy_example_new.py train --new=False --sm=True --outdir=out/score_matching --viz=False',
     }
 
     # --- Plotting Commands ---
     # These generate plots for each experiment, using the baseline model as a guide for comparison.
     plotting_experiments = {
         'baseline': 'python toy_example_new.py plot --new=False --net=out/baseline/iter_4096.pt --gnet=out/baseline/iter_1024.pt --save=ablation_images/baseline.png',
-        'new_G_not_trained': 'python toy_example_new.py plot --new=True --net=out/new_G_not_trained/iter_4096.pt --gnet=out/new_G_not_trained/iter_1024.pt --save=ablation_images/g_not_trained.png',
-        'new_G_trained': 'python toy_example_new.py plot --new=True  --net=out/new_G_trained/iter_4096.pt --gnet=out/new_G_trained/iter_1024.pt --save=ablation_images/g_trained.png',
-        'score_matching': 'python toy_example_new.py plot --new=True  --net=out/score_matching/iter_4096.pt --gnet=out/score_matching/iter_1024.pt --save=ablation_images/score-matching.png',
+        'new_method': 'python toy_example_new.py plot --new=True --net=out/new_method/iter_4096.pt --gnet=out/new_method/iter_1024.pt --save=ablation_images/g_not_trained.png',
+        'score_matching': 'python toy_example_new.py plot --new=False  --net=out/score_matching/iter_4096.pt --gnet=out/score_matching/iter_1024.pt --save=ablation_images/score-matching.png',
     }
 
     # Determine which experiments to run
