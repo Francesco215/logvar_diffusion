@@ -8,17 +8,17 @@ import click
 def main(exp, action):
     # --- Training Commands ---
     training_experiments = {
-        'baseline': 'python toy_example_new.py train --new=False --sm=False --outdir=out/baseline --viz=False',
-        'new_method': 'python toy_example_new.py train --new=True --sm=False --outdir=out/new_method --viz=False',
-        'score_matching': 'python toy_example_new.py train --new=False --sm=True --outdir=out/score_matching --viz=False',
+        'baseline': 'python training.py train --new=False --sm=False --outdir=out/baseline --viz=False',
+        'new_method': 'python training.py train --new=True --sm=False --outdir=out/new_method --viz=False',
+        'score_matching': 'python training.py train --new=False --sm=True --outdir=out/score_matching --viz=False',
     }
 
     # --- Plotting Commands ---
     # These generate plots for each experiment, using the baseline model as a guide for comparison.
     plotting_experiments = {
-        'baseline': 'python toy_example_new.py plot --new=False --net=out/baseline/iter_4096.pt --gnet=out/baseline/iter_1024.pt --save=ablation_images/baseline.png',
-        'new_method': 'python toy_example_new.py plot --new=True --net=out/new_method/iter_4096.pt --gnet=out/new_method/iter_1024.pt --save=ablation_images/new_method.png',
-        'score_matching': 'python toy_example_new.py plot --new=False  --net=out/score_matching/iter_4096.pt --gnet=out/score_matching/iter_1024.pt --save=ablation_images/score-matching.png',
+        'baseline': 'python training.py plot --new=False --net=out/baseline/iter_4096.pt --gnet=out/baseline/iter_1024.pt --save=ablation_images/baseline.png',
+        'new_method': 'python training.py plot --new=True --net=out/new_method/iter_4096.pt --gnet=out/new_method/iter_1024.pt --save=ablation_images/new_method.png',
+        'score_matching': 'python training.py plot --new=False  --net=out/score_matching/iter_4096.pt --gnet=out/score_matching/iter_1024.pt --save=ablation_images/score-matching.png',
     }
 
     # Determine which experiments to run

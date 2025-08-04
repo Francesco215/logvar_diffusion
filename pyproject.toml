@@ -1,18 +1,14 @@
 [project]
 name = "logvar-diffusion"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0.0"
+description = "A small project for a different diffusion model"
 readme = "README.md"
 dependencies = [
     "torch>=2.7",
-    "awscli",
     "setuptools",
     "einops",
-    "ipykernel",
-    "ipywidgets",
     "matplotlib",
-    "moviepy",
-    "scipy",
+    "numpy",
     "click",
     "tqdm",
 ]
