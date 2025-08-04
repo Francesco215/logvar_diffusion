@@ -122,6 +122,7 @@ $$
 \sigma_\phi(x,\sigma) = c_\textrm{var}\cdot\exp\left[\frac 12 G_\phi(c_\textrm{in}\cdot x, c_\textrm{noise})\right]
 \end{cases}
 $$
+
 Where $(F_\theta,G_\phi)$ is the actual neural network output, and $c_\textrm{skip},\ c_\textrm{out},\ c_\textrm{in},\ c_\textrm{noise}$ are equal to 
 
 $$
@@ -135,6 +136,7 @@ c_\textrm{var}(\sigma) =  \sigma\sqrt{1 + \frac{\sigma_\textrm{data}^2}{\sigma^2
 $$
 
 we can now plug all of this in the original loss formula
+
 $$
 L = \frac{1}{2} \left[\log \sigma_\phi^2 + \frac{\sigma^2 + (\mu_\theta - x_0)^2}{\sigma_\phi^2} + \log(2\pi) \right]
 $$
@@ -144,6 +146,7 @@ Substituiting this into the original formula of the loss we get the new numerica
 $$
 L = G_\phi +e^{-G_\phi}\left[1+ \frac{\sigma^2_\textrm{data}}{\sigma^2 + 2\sigma^2_\textrm{data}}\left(\left\| F_{\theta} - \frac{\sigma x_0 - \sigma_\textrm{data}^2 \epsilon}{\sigma_\textrm{data}\sqrt{\sigma^2 + \sigma_\textrm{data}^2}} \right\|^2-1\right)\right]
 $$
+
 > Hint
 > If you want to verify this formula, first substituite $\sigma_\phi$ and then substituite $\mu_\theta$
 
@@ -152,4 +155,5 @@ Using this parametrization we can re-write the log prob.
 $$
 \log q(x|\tilde x) =- \frac{1}{2} \left[G_\phi + e^{-G_\phi} \left( \frac{\sigma_\textrm{data}^2}{\sigma^2 + 2\sigma_\textrm{data}^2} \right) \left\| F_{\theta} - \frac{x - c_\textrm{skip} \cdot \tilde x}{c_\textrm{out}} \right\|^2+ \log(2\pi c_\textrm{var}^2)\right]
 $$
+
 As you can see, this formulation is numerically stable for all values of $\sigma$
