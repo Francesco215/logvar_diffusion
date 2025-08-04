@@ -1,4 +1,42 @@
 # A Generalized Diffusion Model Training Framework
+> [!Note]
+> This is a Weekend-ish project that I did
+
+## How it Started:
+What if we train a diffusion model capable of estimating the confidence of each prediction?
+
+There are the rules I decided to follow
+- I have to maximise the Log probability.
+- The probability distribuition of the prediction must be gaussian.
+- The result must be a generalization of the standard diffusion model theory
+- If I set the confidence level equal to the noise level $\sigma$ of the diffusion process I must get exactly the same equations as in [EDM](https://arxiv.org/abs/2206.00364)
+
+So, I did the math and run a small scale experiment taken from [Guiding a Diffusion Model with a Bad Version of Itself](https://arxiv.org/abs/2406.02507) to compare my method to the "standard" diffusion modelling method.
+
+## How to run the code
+
+The code is very light weight and it can even run in the laptop
+
+To run both experiments + the score-matching experiment just run the ablations.py code
+
+#### Step by step
+
+todo
+the results will be saved in a folder
+
+## Results
+For this small scale experiment I did the two models end up having the exact same performance. In the future more experiments should be run on more complex datasets to see if it yields an improvement
+
+<img width="49%" alt="baseline" src="https://github.com/user-attachments/assets/e73f69c6-a6c2-4f82-b497-5ca619e1086d" />
+
+<img width="49%" alt="new_method" src="https://github.com/user-attachments/assets/506d78e7-fab4-455d-837e-188240bc42f6" />
+
+> On the left the standard EDM method, on the right my confidence-aware method. 
+
+# How it works
+
+> [!Warning]
+> This is the nerd area, procede with caution
 
 Let’s make score-based diffusion modeling more rigorous.
 
@@ -82,7 +120,7 @@ $$
 \frac{\partial L}{\partial \mu_\theta} = \frac{\mu_\theta - x_0}{\sigma_\phi^2}
 $$
 
-This resembles the gradient of the MSE loss, but weighted by the expected prediction error $\sigma_\phi^2$. This is good because it also act as a loss-weight mechanism, this way training is more stable.
+This resembles the gradient of the MSE loss, but weighted by the expected prediction error $\sigma_\phi^2$. This is good because it also act as a loss-weight mechanism, this way training is more stable. That's pretty nice because in [EDM2](https://arxiv.org/abs/2312.02696) the authors had to engineer externally a very similar loss weighting mechanism.
 
 
 ## The Score Function
