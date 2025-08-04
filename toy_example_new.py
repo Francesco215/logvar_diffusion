@@ -30,13 +30,12 @@ elif torch.backends.mps.is_available():
     default_device = 'mps'
 else:
     default_device = 'cpu' 
-
+torch.autograd.set_detect_anomaly(True)
 #----------------------------------------------------------------------------
 # Multivariate mixture of Gaussians. Allows efficient evaluation of the
 # probability density function (PDF) and score vector, as well as sampling,
 # using the GPU. The distribution can be optionally smoothed by applying heat
 # diffusion (sigma >= 0) on a per-sample basis.
-
 class GaussianMixture(torch.nn.Module):
     def __init__(self,
         phi,                    # Per-component weight: [comp]
@@ -90,6 +89,7 @@ class GaussianMixture(torch.nn.Module):
         w = w[..., None]
         return (w * z).sum(-2) / w.sum(-2) # x.shape
 
+
     # Draw the given number of random samples from p(x; sigma).
     # Draw the given number of random samples from p(x; sigma).
     torch.no_grad()
@@ -102,6 +102,7 @@ class GaussianMixture(torch.nn.Module):
         y = torch.einsum('...ij,...j,...kj,...k->...i', Q, L.sqrt(), Q, x)    # y = sqrt(Sigma') @ x: [..., dim]
         Sigma = torch.einsum('... i k,... k,... j k -> ... i j', Q, L + sigma.unsqueeze(-1)**2, Q)
         return y + self.mu[i], Sigma # [..., dim]
+
 
 
 #----------------------------------------------------------------------------
@@ -154,6 +155,7 @@ def gt(classes='A', device=torch.device('cpu'), seed=2, origin=np.array([0.0030,
 # Denoiser model for learning 2D toy distributions.
 
 class ToyModel(torch.nn.Module):
+    # Replace the __init__ and forward methods in your `ToyModel` class
     def __init__(self,
         in_dim      = 2,      # Input dimensionality.
         num_layers  = 4,      # Number of hidden layers.
@@ -170,6 +172,7 @@ class ToyModel(torch.nn.Module):
             self.layers.append(torch.nn.Linear(hidden_dim, hidden_dim))
         self.layers.append(torch.nn.SiLU())
 
+
         self.layer_F = torch.nn.Linear(hidden_dim, 2)
         self.gain_F  = torch.nn.Parameter(torch.zeros([]))
 
@@ -178,11 +181,13 @@ class ToyModel(torch.nn.Module):
             self.gain_G  = torch.nn.Parameter(torch.zeros([]))
         self.new=new
 
+
     def forward(self, x, sigma=0):
         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
 
         y = self.layers(torch.cat([c_in*x, sigma.log() / 4, torch.ones_like(sigma)], dim=-1))
+
         F = self.layer_F(y) * self.gain_F
         if not self.new: return F, None
 
@@ -220,15 +225,33 @@ class ToyModel(torch.nn.Module):
 
         return loss.mean()
 
-    def logp(self, x, sigma=0):
-        F, G = self(x, sigma) 
+        # 3. Compute the KL Divergence Loss: L = 0.5 * [ tr(P_phi @ S) + err^T @ P_phi @ err - logdet(P_phi) ]
+        # This avoids all matrix inversions/solves!
         
+
         # Ensure sigma has the correct shape for broadcasting
         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=x.device).broadcast_to(x.shape[:-1]).unsqueeze(-1)
         target = x * sigma / (self.sigma_data * (sigma**2 + self.sigma_data**2)**0.5)
         error = (F - target)
 
+
+
+    def logp(self, x, sigma=0):
+        """
+        Calculates log q(y | x, sigma) evaluated at y=x, using the precision matrix.
+        This version correctly handles both batched and grid inputs.
+        """
+        # --- Reshape Input for Consistent Batch Handling ---
+        original_shape = x.shape
+        if x.ndim > 2:
+            x = x.reshape(-1, original_shape[-1])
+
+        # Get raw network outputs for mean (F) and precision matrix (G).
+        F_theta, G_raw = self(x, sigma)
+
+        # --- Case 1: Original Isotropic Model (for backward compatibility) ---
         if not self.new:
+
             error = error**2
             coeff = self.sigma_data**2/(sigma**2+self.sigma_data**2)
             return -.5*(error*coeff).sum(dim=-1)
@@ -244,6 +267,7 @@ class ToyModel(torch.nn.Module):
         
         # Sum the log-probabilities over the feature dimension
         return log_prob
+
 
     def pdf(self, x, sigma=0):
         logp = self.logp(x, sigma=sigma)
@@ -284,13 +308,20 @@ def do_train(new=False, score_matching=True,
     pkl_pattern=None, pkl_iter=256, viz_iter=32,
     device=torch.device(default_device),
 ):
+    # The ground truth score function is only valid for isotropic noise.
+    # Therefore, score_matching=True is not supported for the new method.
+    if new and score_matching:
+        warnings.warn("Score matching with ground truth is not supported for the new non-isotropic model. Training with NLL loss instead.")
+        score_matching = False
+
     torch.manual_seed(seed)
 
     # Initialize model.
     net = ToyModel(num_layers=num_layers, hidden_dim=hidden_dim, sigma_data=sigma_data, new=new).to(device).train()
     ema = copy.deepcopy(net).eval().requires_grad_(False)
     opt = torch.optim.Adam(net.parameters(), betas=(0.9, 0.99))
-    print(f"score matching {score_matching}")
+    print(f"Training with new method: {new}, Score matching: {score_matching}")
+
     # Initialize plot.
     if viz_iter is not None:
         plt.ion()
@@ -306,7 +337,7 @@ def do_train(new=False, score_matching=True,
     for iter_idx in pbar:
 
         # Visualize current sample distribution.
-        if viz_iter is not None and iter_idx % viz_iter == 0:
+        if viz_iter is not None and iter_idx > 0 and iter_idx % viz_iter == 0:
             for x in plt.gca().lines: x.remove()
             do_plot(ema, elems={'samples'}, device=device)
             plt.savefig("immagine.png")
@@ -315,33 +346,43 @@ def do_train(new=False, score_matching=True,
         # Execute one training iteration.
         opt.param_groups[0]['lr'] = lr_ref / np.sqrt(max(iter_idx / lr_iter, 1))
         opt.zero_grad()
+
         sigma = (torch.randn(batch_size, device=device) * P_std + P_mean).exp()
 
         clean_samples, Sigma = gt(classes, device).sample((batch_size,), torch.zeros_like(sigma))
         epsilon = torch.randn_like(clean_samples)
         noisy_samples = clean_samples + epsilon * sigma.unsqueeze(-1)
 
-        if score_matching:
+
+        # Generate data and calculate loss based on the training method.
+        if score_matching: # This path is only for the original model (new=False)
+            clean_samples = gt(classes, device).sample((batch_size,))
+            noisy_samples = clean_samples + torch.randn_like(clean_samples) * sigma.unsqueeze(-1)
             gt_scores = gt(classes, device).score(noisy_samples, sigma)
             net_scores = net.score(noisy_samples, sigma, graph=True)
-            score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)).mean()
+            score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).sum(-1)).mean()
             score_matching_loss.backward()
             with torch.no_grad():
+
                 nll = net.loss(clean_samples, sigma, Sigma)
         else:
             nll = net.loss(clean_samples, sigma, Sigma)
             nll.backward()
             if iter_idx%16==0:
+
                 with torch.no_grad():
                     gt_scores = gt(classes, device).score(noisy_samples, sigma)
                     net_scores = net.score(noisy_samples, sigma, graph=False)
-                    score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)).mean()
+                    score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).sum(-1)).mean()
+            else:
+                score_matching_loss = torch.tensor(float('nan'))
+
 
         pbar.set_postfix_str(f"Score-Matching Loss: {score_matching_loss.item():.3f}, Negative Log-Likelyhood Loss: {nll.item():.3f}")
         opt.step()
 
+
         # Update EMA.
-        # MODIFIED: Replaced phema with a standard fixed EMA decay.
         beta = ema_decay
         for p_net, p_ema in zip(net.parameters(), ema.parameters()):
             p_ema.copy_(p_net.detach().lerp(p_ema, beta))
@@ -351,8 +392,10 @@ def do_train(new=False, score_matching=True,
             pkl_path = pkl_pattern % (iter_idx + 1)
             if os.path.dirname(pkl_path):
                 os.makedirs(os.path.dirname(pkl_path), exist_ok=True)
+
             # MODIFIED: Replaced pickle with torch.save
             torch.save({k: v.cpu() for k, v in ema.state_dict().items()}, pkl_path)
+
 
 
 #----------------------------------------------------------------------------
