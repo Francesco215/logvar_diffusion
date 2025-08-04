@@ -1,85 +1,123 @@
 # A Generalized Diffusion Model Training Framework
-> [!Note]
-> This is a Weekend-ish project that I did
 
-## How it Started:
-What if we train a diffusion model capable of estimating the confidence of each prediction?
+> \[!Note]
+> This is a weekend-ish project I worked on for fun.
 
-There are the rules I decided to follow
-- I have to maximise the Log probability.
-- The probability distribuition of the prediction must be gaussian.
-- The result must be a generalization of the standard diffusion model theory
-- If I set the confidence level equal to the noise level $\sigma$ of the diffusion process I must get exactly the same equations as in [EDM](https://arxiv.org/abs/2206.00364)
 
-So, I did the math and run a small scale experiment taken from [Guiding a Diffusion Model with a Bad Version of Itself](https://arxiv.org/abs/2406.02507) to compare my method to the "standard" diffusion modelling method.
 
-## How to run the code
+## How It Started
 
-The code is very light weight and it can even run in the laptop
+What if we trained a diffusion model capable of estimating the **confidence** of each prediction?
 
-To run both experiments + the score-matching experiment just run the ablations.py code
+I also decided to follow these tight constraints:
 
-#### Step by step
+* Maximize the log probability and nothing else.
+* The prediction distribution must be Gaussian.
+* The result should generalize the standard diffusion model framework.
+* If the confidence level is set equal to the diffusion process noise \$\sigma\$, it should reduce exactly to the equations from [EDM](https://arxiv.org/abs/2206.00364).
 
-todo
-the results will be saved in a folder
+So, I did the math and ran a small-scale experiment based on [Guiding a Diffusion Model with a Bad Version of Itself](https://arxiv.org/abs/2406.02507) to compare my method to the “standard” diffusion modeling approach.
 
 ## Results
-For this small scale experiment I did the two models end up having the exact same performance. In the future more experiments should be run on more complex datasets to see if it yields an improvement
+
+In this small-scale experiment, the two models ended up with nearly identical performance. More experiments on complex datasets will be needed to determine whether the method brings real improvements.
 
 <img width="49%" alt="baseline" src="https://github.com/user-attachments/assets/e73f69c6-a6c2-4f82-b497-5ca619e1086d" />
 
 <img width="49%" alt="new_method" src="https://github.com/user-attachments/assets/506d78e7-fab4-455d-837e-188240bc42f6" />
 
-> On the left the standard EDM method, on the right my confidence-aware method. 
+> Left: standard EDM method.
+> Right: my confidence-aware method.
 
-# How it works
 
-> [!Warning]
-> This is the nerd area, procede with caution
+
+
+## How to Run the Code
+
+The code is lightweight and can even run on a laptop.
+
+To run both experiments (plus the score-matching experiment), simply run the `ablations.py` script.
+
+### Step-by-Step
+
+1. Install `uv` with pip:
+
+   ```bash
+   pip install uv
+   ```
+
+2. Create and activate a virtual environment:
+
+   ```bash
+   uv venv
+   source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+   ```
+
+3. Install the package:
+
+   ```bash
+   uv pip install -e .
+   ```
+
+4. Run the experiment:
+
+   ```bash
+   python ablations.py
+   ```
+
+Results will be saved to a folder.
+
+
+
+# How It Works
+
+> \[!Warning]
+> This is the nerd area, proceed with caution
 
 Let’s make score-based diffusion modeling more rigorous.
 
-Suppose we have a dataset made of a single sample $x_0$, and we add noise to this sample as follows:
+Suppose we have a dataset containing a single sample \$x\_0\$, and we add noise to it as follows:
 
 $$
 \tilde x = x_0 + \sigma \cdot \epsilon
 $$
 
-This implies that the probability distribution is:
+This implies that the distribution is:
 
 $$
 p(x) = \mathcal{N}(x \mid x_0, \sigma^2)
 $$
 
-**But** what if $x_0$ is itself sampled from a small Gaussian? After all, most VAEs encode images using non-isotropic Gaussians and then the diffusion process adds noise on top. In this case:
+**But** what if \$x\_0\$ is itself sampled from a Gaussian? For instance, many VAEs encode images using non-isotropic Gaussians, and the diffusion process then adds noise on top. In that case:
 
 $$
-\tilde x = x_\textrm{vae} + \sigma_{\text{vae}} \cdot \epsilon + \sigma_{\text{diff}} \cdot \epsilon
+\tilde x = x_{\textrm{VAE}} + \sigma_{\textrm{VAE}} \cdot \epsilon + \sigma_{\textrm{diff}} \cdot \epsilon
 $$
 
-which gives:
+Which gives:
 
 $$
-p(x) = \mathcal{N}\left(x \mid x_0, \sigma_{\text{VAE}}^2 + \sigma_{\text{diff}}^2 \right)
+p(x) = \mathcal{N}\left(x \mid x_0, \sigma_{\text{VAE}}^2 + \sigma_{\text{diff}}^2\right)
 $$
 
-You might think these two processes need separate treatments, but I’ll show you how to hit two pigeons with one stone.
+You might think these two processes need different treatments — but we can hit two birds with one stone.
 
-From now on, we’ll consider the case where we sampe $\tilde x \sim p(x)$:
+From now on, we consider the general case \$\tilde x \sim p(x)\$:
 
 $$
 \tilde x = x_0 + \sigma \cdot \epsilon
 $$
 
-and allow $\sigma$ to be non-isotropic.
+And we allow \$\sigma\$ to be **non-isotropic**.
+
 
 
 ## The Loss Function: From First Principles
 
-How do you choose the loss function? You don’t — nature does it for you.
+How do you choose the loss function?
+You don’t — **nature does it for you**.
 
-Given a data point $x$ and known noise level $\sigma^2$, we want to estimate the original distribution of $x_0$. That is, we aim to learn two functions $\mu_\theta(\tilde x)$, $\sigma_\phi(\tilde x)$ such that:
+Given a data point \$x\$ and known noise level \$\sigma^2\$, we want to recover the original \$x\_0\$. That is, we learn two functions \$\mu\_\theta(\tilde x)\$ and \$\sigma\_\phi(\tilde x)\$ such that:
 
 $$
 q(x \mid \tilde x) = \mathcal{N}(x \mid \mu_\theta, \sigma_\phi^2)
@@ -97,101 +135,106 @@ $$
 L = \mathrm{KL}(p \| q) + S(p)
 $$
 
-Carrying out the KL divergence calculation, assuming known noise level $\sigma$, we get:
+Carrying out the KL divergence, we get:
 
 $$
-L = \frac{1}{2} \left[\log \sigma_\phi^2 + \frac{\sigma^2 + (\mu_\theta - x_0)^2}{\sigma_\phi^2} + \log(2\pi) \right]
+L = \frac{1}{2} \left[\log \sigma_\phi^2 + \frac{\sigma^2 + (\mu_\theta - x_0)^2}{\sigma_\phi^2} + \log(2\pi)\right]
 $$
-
 
 ### Properties of the Loss
 
-At the minimum, the optimal value of $\sigma_\phi$ satisfies:
+At the minimum, the optimal variance satisfies:
 
 $$
 \frac{\partial L}{\partial \sigma_\phi} = 0 \quad \Rightarrow \quad \sigma_\phi^2 = \sigma^2 + (\mu_\theta - x_0)^2
 $$
 
-So the learned variance converges to the sum of the added noise and the model’s squared prediction error — an adaptive uncertainty estimate.
+So the learned variance captures both the added noise and the model’s prediction error — an **adaptive uncertainty estimate**.
 
-Also, the gradient with respect to $\mu_\theta$ is:
+Also, the gradient with respect to \$\mu\_\theta\$ is:
 
 $$
 \frac{\partial L}{\partial \mu_\theta} = \frac{\mu_\theta - x_0}{\sigma_\phi^2}
 $$
 
-This resembles the gradient of the MSE loss, but weighted by the expected prediction error $\sigma_\phi^2$. This is good because it also act as a loss-weight mechanism, this way training is more stable. That's pretty nice because in [EDM2](https://arxiv.org/abs/2312.02696) the authors had to engineer externally a very similar loss weighting mechanism.
+This resembles the gradient of MSE, but weighted by the **predicted** error — providing a natural form of **loss weighting**. This is interesting because in [EDM2](https://arxiv.org/abs/2312.02696), a similar weighting was manually engineered, but here it emerges on its own from the equations 🔥.
+
 
 
 ## The Score Function
 
-The core objective of score-based diffusion models is to estimate the **score function**, defined as:
+In score-based diffusion, we aim to estimate the **score function**:
 
 $$
-s(x) = \nabla_x \log p(x)
+s(x|\sigma) = \nabla_x \log p(x|\sigma)
 $$
 
-Thanks to Tweedie's formula the expected value of the score can be expressed as
-
-So a natural estimator of the **true score** of $p(x)$ is:
+Using Tweedie's formula, a natural estimator of the score is:
 
 $$
-s(x|\sigma) = \frac {x-\mathbb E[x_0|x,\sigma]}{\sigma^2}= \frac {x-\mathbb \mu_\theta}{\sigma^2}
+\mathbb E \left[s(x \mid \sigma)\right] = \frac{x - \mathbb{E}[x_0 \mid x, \sigma]}{\sigma^2} = \frac{x - \mu_\theta}{\sigma^2}
 $$
 
-So we don't need to evaluate $\sigma_\phi$ for the score
+So we don’t need \$\sigma\_\phi\$ to compute the score.
+
+
 
 ### Solving the ODE
 
-The ODE can be solved like with standard diffusion modelling techniques
+We can solve the denoising ODE using the usual techniques:
 
-$$\frac{d\mathbf{x}}{d\sigma} = \frac{x - \mu_\theta}{\sigma}$$
+$$
+\frac{d\mathbf{x}}{d\sigma} = \frac{x - \mu_\theta}{\sigma}
+$$
 
 
 
 ## Preconditioning
-When it comes with writing an implementation one has to be careful, Neural networks don't like really large and really small numbers.
 
-Training a model to predict directly $\mu_\theta$ and $\sigma_\phi$ is far from ideal. For this reason we have to re-parametrize it.
+When implementing this in practice, we must be cautious — neural networks don't handle very large or very small values well.
 
-$$
-\begin{cases}
-\mu_\theta(x, \sigma) = c_\textrm{skip}\cdot x + c_\textrm{out}\cdot F_\theta(c_\textrm{in}\cdot x,c_\textrm{noise})\\
-\sigma_\phi(x,\sigma) = c_\textrm{var}\cdot\exp\left[\frac 12 G_\phi(c_\textrm{in}\cdot x, c_\textrm{noise})\right]
-\end{cases}
-$$
-
-Where $(F_\theta,G_\phi)$ is the actual neural network output, and $c_\textrm{skip},\ c_\textrm{out},\ c_\textrm{in},\ c_\textrm{noise}$ are equal to 
+Training a model to predict \$\mu\_\theta\$ and \$\sigma\_\phi\$ directly is problematic. Instead, we reparameterize:
 
 $$
 \begin{cases}
-c_\textrm{skip}(\sigma) = \sigma_\textrm{data}/(\sigma^2 + \sigma_\textrm{data}^2)\\
-c_\textrm{out}(\sigma) = \sigma\cdot \sigma_\textrm{data}/\sqrt{\sigma^2 + \sigma_\textrm{data}^2}\\
-c_\textrm{in}(\sigma) = 1/\sqrt{\sigma^2 + \sigma_\textrm{data}^2}\\
-c_\textrm{noise}(\sigma)=\frac 14 \log\sigma\\
-c_\textrm{var}(\sigma) =  \sigma\sqrt{1 + \frac{\sigma_\textrm{data}^2}{\sigma^2+\sigma_\textrm{data}^2}}
+\mu_\theta(x, \sigma) = c_{\textrm{skip}} \cdot x + c_{\textrm{out}} \cdot F_\theta(c_{\textrm{in}} \cdot x, c_{\textrm{noise}}) \\
+\sigma_\phi(x, \sigma) = c_{\textrm{var}} \cdot \exp\left[\frac{1}{2} G_\phi(c_{\textrm{in}} \cdot x, c_{\textrm{noise}})\right]
 \end{cases}
 $$
 
-we can now plug all of this in the original loss formula
+Where \$(F\_\theta, G\_\phi)\$ are the neural network outputs, and:
 
 $$
-L = \frac{1}{2} \left[\log \sigma_\phi^2 + \frac{\sigma^2 + (\mu_\theta - x_0)^2}{\sigma_\phi^2} + \log(2\pi) \right]
+\begin{cases}
+c_{\textrm{skip}}(\sigma) = \frac{\sigma_{\textrm{data}}}{\sigma^2 + \sigma_{\textrm{data}}^2} \\
+c_{\textrm{out}}(\sigma) = \frac{\sigma \cdot \sigma_{\textrm{data}}}{\sqrt{\sigma^2 + \sigma_{\textrm{data}}^2}} \\
+c_{\textrm{in}}(\sigma) = \frac{1}{\sqrt{\sigma^2 + \sigma_{\textrm{data}}^2}} \\
+c_{\textrm{noise}}(\sigma) = \frac{1}{4} \log \sigma \\
+c_{\textrm{var}}(\sigma) = \sigma \cdot \sqrt{1 + \frac{\sigma_{\textrm{data}}^2}{\sigma^2 + \sigma_{\textrm{data}}^2}}
+\end{cases}
 $$
 
-Substituiting this into the original formula of the loss we get the new numerically stable loss for $\sigma\to 0$ and $\sigma \to \infty$.
+We now substitute everything back into the original loss:
 
 $$
-L = G_\phi +e^{-G_\phi}\left[1+ \frac{\sigma^2_\textrm{data}}{\sigma^2 + 2\sigma^2_\textrm{data}}\left(\left\| F_{\theta} - \frac{\sigma x_0 - \sigma_\textrm{data}^2 \epsilon}{\sigma_\textrm{data}\sqrt{\sigma^2 + \sigma_\textrm{data}^2}} \right\|^2-1\right)\right]
+L = \frac{1}{2} \left[\log \sigma_\phi^2 + \frac{\sigma^2 + (\mu_\theta - x_0)^2}{\sigma_\phi^2} + \log(2\pi)\right]
 $$
 
-> Hint
-> If you want to verify this formula, first substituite $\sigma_\phi$ and then substituite $\mu_\theta$
-
-Using this parametrization we can re-write the log prob.
+After substitution, we get a numerically stable loss for both \$\sigma \to 0\$ and \$\sigma \to \infty\$:
 
 $$
-\log q(x|\tilde x) =- \frac{1}{2} \left[G_\phi + e^{-G_\phi} \left( \frac{\sigma_\textrm{data}^2}{\sigma^2 + 2\sigma_\textrm{data}^2} \right) \left\| F_{\theta} - \frac{x - c_\textrm{skip} \cdot \tilde x}{c_\textrm{out}} \right\|^2+ \log(2\pi c_\textrm{var}^2)\right]
+L = G_\phi + e^{-G_\phi} \left[1 + \frac{\sigma_{\textrm{data}}^2}{\sigma^2 + 2\sigma_{\textrm{data}}^2} \left(\left\|F_\theta - \frac{\sigma x_0 - \sigma_{\textrm{data}}^2 \epsilon}{\sigma_{\textrm{data}} \sqrt{\sigma^2 + \sigma_{\textrm{data}}^2}} \right\|^2 - 1\right)\right]
 $$
 
-As you can see, this formulation is numerically stable for all values of $\sigma$
+> \[!Hint]
+> To verify this, first substitute \$\sigma\_\phi\$ and then \$\mu\_\theta\$ into the original loss.
+
+
+
+Using this reparametrization, we can rewrite the log-probability as:
+
+$$
+\log q(x \mid \tilde x) = -\frac{1}{2} \left[G_\phi + e^{-G_\phi} \left( \frac{\sigma_{\textrm{data}}^2}{\sigma^2 + 2\sigma_{\textrm{data}}^2} \right) \left\|F_\theta - \frac{x - c_{\textrm{skip}} \cdot \tilde x}{c_{\textrm{out}}} \right\|^2 + \log(2\pi c_{\textrm{var}}^2)\right]
+$$
+
+This formulation is **numerically stable** for all values of \$\sigma\$.
