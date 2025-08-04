@@ -17,7 +17,7 @@ def main(exp, action):
     # These generate plots for each experiment, using the baseline model as a guide for comparison.
     plotting_experiments = {
         'baseline': 'python toy_example_new.py plot --new=False --net=out/baseline/iter_4096.pt --gnet=out/baseline/iter_1024.pt --save=ablation_images/baseline.png',
-        'new_method': 'python toy_example_new.py plot --new=True --net=out/new_method/iter_4096.pt --gnet=out/new_method/iter_1024.pt --save=ablation_images/g_not_trained.png',
+        'new_method': 'python toy_example_new.py plot --new=True --net=out/new_method/iter_4096.pt --gnet=out/new_method/iter_1024.pt --save=ablation_images/new_method.png',
         'score_matching': 'python toy_example_new.py plot --new=False  --net=out/score_matching/iter_4096.pt --gnet=out/score_matching/iter_1024.pt --save=ablation_images/score-matching.png',
     }
 

@@ -212,11 +212,11 @@ class ToyModel(torch.nn.Module):
 
         error = coeff*error
         Sigma_phi = einops.einsum(S,S, ' ... i j, ... k j -> ... i k')
-        Sigma_trace = einops.einsum(Sigma_phi,Sigma, '... i j, ... i j -> ...')/(sigma**2*c_var_2+1e-4)
+        Sigma_trace = (Sigma_phi*Sigma).sum(dim=(-1,-2))/(sigma**2*c_var_2+1e-8)
         sigma_trace = (S**2).sum(dim=(-1,-2))/c_var_2
     
         # This ensures the loss is minimized correctly instead of diverging.
-        loss = .5*(error + sigma_trace + logdet)
+        loss = .5*(error + sigma_trace + Sigma_trace + logdet)
 
         return loss.mean()
 
@@ -259,20 +259,9 @@ class ToyModel(torch.nn.Module):
         c_out = sigma_b * self.sigma_data / (sigma_b**2 + self.sigma_data**2).sqrt()
         mu_theta = c_skip * x + c_out * F
 
-        # --- Calculate sigma_phi(x, sigma)^2 ---
-        if False:
-            # Use the full learned covariance matrix
-            _, S = transform_G(G)
-            # The score is s(x) = Sigma_phi^-1 @ (mu_theta - x)
-            # We use solve for numerical stability: A^-1 @ b -> torch.linalg.solve(A, b)
-            score_vec = mu_theta - x
-
-            Sigma_phi = einops.einsum(S, S, 'b i j, b i k -> b j k')
-            score = torch.einsum('... i k,... j k, ... j->... i', S, S, score_vec)
-        else:
-            # Fallback to the old isotropic score
-            sigma_phi_sq = sigma_b**2
-            score = (mu_theta - x) / sigma_phi_sq
+        # Fallback to the old isotropic score
+        sigma_phi_sq = sigma_b**2
+        score = (mu_theta - x) / sigma_phi_sq
             
         return score
 
@@ -290,7 +279,7 @@ def transform_G(G):
 # Train a 2D toy model with the given parameters.
 
 def do_train(new=False, score_matching=True,
-    classes='A', num_layers=4, hidden_dim=64, batch_size=4<<10, total_iter=4<<10, seed=0,
+    classes='A', num_layers=4, hidden_dim=64, batch_size=4<<9, total_iter=4<<10, seed=0,
     P_mean=-2.4, P_std=1.5, sigma_data=0.5, lr_ref=1e-2, lr_iter=512, ema_decay=0.99,
     pkl_pattern=None, pkl_iter=256, viz_iter=32,
     device=torch.device(default_device),
