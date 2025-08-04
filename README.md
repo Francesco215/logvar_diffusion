@@ -2,6 +2,8 @@
 
 > \[!Note]
 > This is a weekend-ish project I worked on for fun.
+>
+> I want to thank the authors of [Guiding a Diffusion Model with a Bad Version of Itself](https://arxiv.org/abs/2406.02507) for providing the valuable test bench I evaluated my model against
 
 
 
