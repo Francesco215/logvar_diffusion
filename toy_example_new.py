@@ -212,11 +212,11 @@ class ToyModel(torch.nn.Module):
 
         error = coeff*error
         Sigma_phi = einops.einsum(S,S, ' ... i j, ... k j -> ... i k')
-        Sigma_trace = einops.einsum(Sigma_phi,Sigma, '... i j, ... j i -> ...')/(sigma**2*c_var_2)
+        Sigma_trace = einops.einsum(Sigma_phi,Sigma, '... i j, ... i j -> ...')/(sigma**2*c_var_2)
         sigma_trace = (S**2).sum(dim=(-1,-2))/c_var_2
     
         # This ensures the loss is minimized correctly instead of diverging.
-        loss = .5*(error + sigma_trace + Sigma_trace + logdet)
+        loss = .5*(error + sigma_trace  + logdet)
 
         return loss.mean()
 
@@ -265,7 +265,7 @@ class ToyModel(torch.nn.Module):
         mu_theta = c_skip * x + c_out * F
 
         # --- Calculate sigma_phi(x, sigma)^2 ---
-        if self.new:
+        if False:
             # Use the full learned covariance matrix
             _, S = transform_G(G)
             # The score is s(x) = Sigma_phi^-1 @ (mu_theta - x)
