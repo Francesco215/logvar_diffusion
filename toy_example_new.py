@@ -91,15 +91,17 @@ class GaussianMixture(torch.nn.Module):
         return (w * z).sum(-2) / w.sum(-2) # x.shape
 
     # Draw the given number of random samples from p(x; sigma).
-    torch.no_grad()
     # Draw the given number of random samples from p(x; sigma).
+    torch.no_grad()
     def sample(self, shape, sigma=0, generator=None):
         sigma = torch.as_tensor(sigma, dtype=torch.float32, device=self.mu.device).broadcast_to(shape)
         i = self._sample_lut[torch.randint(len(self._sample_lut), size=sigma.shape, device=sigma.device, generator=generator)]
         L = self._L[i] + sigma[..., None] ** 2                                           # L' = L + sigma * I: [..., dim]
+        Q = self._Q[i]
         x = torch.randn(L.shape, device=sigma.device, generator=generator)              # x ~ N(0, I): [..., dim]
-        y = torch.einsum('...ij,...j,...kj,...k->...i', self._Q[i], L.sqrt(), self._Q[i], x)    # y = sqrt(Sigma') @ x: [..., dim]
-        return y + self.mu[i], None # [..., dim]
+        y = torch.einsum('...ij,...j,...kj,...k->...i', Q[i], L.sqrt(), Q[i], x)    # y = sqrt(Sigma') @ x: [..., dim]
+        Sigma = torch.einsum('... i k,... k,... j k -> ... i j', Q[i], L + sigma.unsqueeze(-1)**2, Q)
+        return y + self.mu[i], Sigma # [..., dim]
 
 
 #----------------------------------------------------------------------------
@@ -203,14 +205,15 @@ class ToyModel(torch.nn.Module):
         if not self.new: return (error**2).sum(-1).mean()
     
         logdet, S = transform_G(G)
-        error = einops.einsum(S,error,'... i j, ... j -> ... j').pow(2).sum(dim=-1)
+        error = einops.einsum(S, error, '... j i, ... j -> ... j').pow(2).sum(dim=-1)
 
         coeff = self.sigma_data**2 / (sigma**2 * 2*self.sigma_data**2)
         c_var_2 = 1+self.sigma_data**2/(sigma**2+self.sigma_data**2)
 
         error = coeff*error
-        Sigma_trace = einops.einsum(S,S,Sigma, '... i j, ... k i, ... j k -> ...')/(sigma**2*c_var_2)
-        sigma_trace = einops.einsum(S,S,'... i j, ... j i -> ...')/c_var_2
+        Sigma_phi = einops.einsum(S,S, ' ... i j, ... k j -> ... i k')
+        Sigma_trace = einops.einsum(Sigma_phi,Sigma, '... i j, ... j i -> ...')/(sigma**2*c_var_2)
+        sigma_trace = (S**2).sum(dim=(-1,-2))/c_var_2
     
         # This ensures the loss is minimized correctly instead of diverging.
         loss = .5*(error + sigma_trace + Sigma_trace + logdet)
@@ -263,13 +266,19 @@ class ToyModel(torch.nn.Module):
 
         # --- Calculate sigma_phi(x, sigma)^2 ---
         if self.new:
-            c_var_sq = sigma_b**2 * (sigma_b**2 + 2 * self.sigma_data**2) / (sigma_b**2 + self.sigma_data**2)
-            sigma_phi_sq = c_var_sq * torch.exp(G)
-        else:
-            sigma_phi_sq = sigma_b**2
+            # Use the full learned covariance matrix
+            _, S = transform_G(G)
+            # The score is s(x) = Sigma_phi^-1 @ (mu_theta - x)
+            # We use solve for numerical stability: A^-1 @ b -> torch.linalg.solve(A, b)
+            score_vec = mu_theta - x
 
-        score = (mu_theta - x) / sigma_phi_sq
-        
+            Sigma_phi = einops.einsum(S, S, 'b i j, b i k -> b j k')
+            score = torch.einsum('... i k,... j k, ... j->... i', S, S, score_vec)
+        else:
+            # Fallback to the old isotropic score
+            sigma_phi_sq = sigma_b**2
+            score = (mu_theta - x) / sigma_phi_sq
+            
         return score
 
 def transform_G(G):
@@ -280,6 +289,7 @@ def transform_G(G):
 
     logdet = -2*(G[:,0] + G[:,1])
 
+    # the learned covariance matrix Sigma_phi^-1 = S@S^T
     return logdet, S
 #----------------------------------------------------------------------------
 # Train a 2D toy model with the given parameters.
@@ -323,7 +333,7 @@ def do_train(new=False, score_matching=True,
         opt.zero_grad()
         sigma = (torch.randn(batch_size, device=device) * P_std + P_mean).exp()
 
-        clean_samples, _ = gt(classes, device).sample((batch_size,), torch.zeros_like(sigma))
+        clean_samples, Sigma = gt(classes, device).sample((batch_size,), torch.zeros_like(sigma))
         epsilon = torch.randn_like(clean_samples)
         noisy_samples = clean_samples + epsilon * sigma.unsqueeze(-1)
 
@@ -333,9 +343,9 @@ def do_train(new=False, score_matching=True,
             score_matching_loss = ((sigma ** 2) * ((gt_scores - net_scores) ** 2).mean(-1)).mean()
             score_matching_loss.backward()
             with torch.no_grad():
-                nll = net.loss(clean_samples, sigma)
+                nll = net.loss(clean_samples, sigma, Sigma)
         else:
-            nll = net.loss(clean_samples, sigma)
+            nll = net.loss(clean_samples, sigma, Sigma)
             nll.backward()
             if iter_idx%16==0:
                 with torch.no_grad():
