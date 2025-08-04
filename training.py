@@ -279,7 +279,7 @@ def transform_G(G):
 # Train a 2D toy model with the given parameters.
 
 def do_train(new=False, score_matching=True,
-    classes='A', num_layers=4, hidden_dim=64, batch_size=4<<9, total_iter=4<<10, seed=0,
+    classes='A', num_layers=4, hidden_dim=64, batch_size=4<<10, total_iter=4<<10, seed=0,
     P_mean=-2.4, P_std=1.5, sigma_data=0.5, lr_ref=1e-2, lr_iter=512, ema_decay=0.99,
     pkl_pattern=None, pkl_iter=256, viz_iter=32,
     device=torch.device(default_device),
