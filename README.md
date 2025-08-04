@@ -143,6 +143,10 @@ $$
 L = \frac{1}{2} \left[\log \sigma_\phi^2 + \frac{\sigma^2 + (\mu_\theta - x_0)^2}{\sigma_\phi^2} + \log(2\pi)\right]
 $$
 
+<img width="99%"  alt="Screenshot 2025-08-05 at 01 02 26" src="https://github.com/user-attachments/assets/f18db702-9d38-4128-be52-ab22bf17f4cc" />
+
+
+
 ### Properties of the Loss
 
 At the minimum, the optimal variance satisfies:
